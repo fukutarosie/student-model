@@ -130,30 +130,7 @@ type AnalysisResult = {
   confidence: number;
   reason: string;
   warning: string;
-};
-
-type ExpressionScoreMap = Record<AnalysisResult["expression"], number>;
-
-type CommunicationResult = {
-  summary: string;
-  communicationTone:
-    | "supportive"
-    | "uncertain"
-    | "tense"
-    | "engaged"
-    | "disengaged"
-    | "mixed";
-  confidence: number;
-  visibleExpression: AnalysisResult["expression"];
-  audioContentExpression: AnalysisResult["expression"];
-  finalExpression: AnalysisResult["expression"];
-  audioContentScores: ExpressionScoreMap;
-  facialExpressionScores: ExpressionScoreMap;
-  combinedExpressionScores: ExpressionScoreMap;
-  spokenSignals: string[];
-  facialSignals: string[];
-  recommendation: string;
-  warning: string;
+  report: ExpressionReport;
 };
 
 type ExpressionScoreMap = Record<Expression, number>;
@@ -269,13 +246,24 @@ function isMediaPipeInfoLog(args: unknown[]) {
   );
 }
 
-function createEmptyScores(): BlendshapeScores {
+function createEmptyScores(): CoreBlendshapeScores {
   return Object.fromEntries(
-    BLENDSHAPE_KEYS.map((key) => [key, 0]),
-  ) as BlendshapeScores;
+    CORE_BLENDSHAPE_KEYS.map((key) => [key, 0]),
+  ) as CoreBlendshapeScores;
 }
 
-function extractScores(categories: Category[]): BlendshapeScores {
+function extractAllScores(categories: Category[]): AllBlendshapeScores {
+  return Object.fromEntries(
+    categories
+      .filter((category) => Number.isFinite(category.score))
+      .map((category) => [
+        category.categoryName,
+        Math.max(0, Math.min(1, category.score)),
+      ]),
+  );
+}
+
+function extractCoreScores(allScores: AllBlendshapeScores): CoreBlendshapeScores {
   const scores = createEmptyScores();
 
   for (const key of CORE_BLENDSHAPE_KEYS) {
@@ -1080,22 +1068,19 @@ export default function FaceExpressionAnalyzer() {
           return;
         }
 
-        const stream = await getMediaStream();
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false,
+        });
 
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
 
-        await applyMediaStream(stream);
-        const audioStream = await getAudioStream();
-
-        if (cancelled) {
-          audioStream.getTracks().forEach((track) => track.stop());
-          return;
-        }
-
-        await applyAudioStream(audioStream);
+        streamRef.current = stream;
+        video.srcObject = stream;
+        await video.play();
 
         const vision = await FilesetResolver.forVisionTasks(WASM_URL);
         const landmarker = await FaceLandmarker.createFromOptions(vision, {
@@ -1239,8 +1224,6 @@ export default function FaceExpressionAnalyzer() {
 
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
-      audioStreamRef.current?.getTracks().forEach((track) => track.stop());
-      audioStreamRef.current = null;
 
       if (console.error === patchedConsoleError) {
         console.error = originalConsoleError;
@@ -1255,182 +1238,6 @@ export default function FaceExpressionAnalyzer() {
       }
     };
   }, [recordingUrl]);
-
-  const switchAudioDevice = useCallback(
-    async (deviceId: string) => {
-      if (!deviceId || deviceId === selectedAudioDeviceId) {
-        return;
-      }
-
-      try {
-        stopSpeechRecognition();
-        setError("");
-        setMicrophoneStatus("Switching microphone");
-        await refreshAudioStream(deviceId);
-        setMicrophoneStatus("Ready");
-      } catch (switchError) {
-        setError(
-          switchError instanceof Error
-            ? switchError.message
-            : "Unable to switch microphone.",
-        );
-      }
-    },
-    [
-      refreshAudioStream,
-      selectedAudioDeviceId,
-      stopSpeechRecognition,
-    ],
-  );
-
-  const toggleMicrophone = useCallback(() => {
-    const audioTracks = audioStreamRef.current?.getAudioTracks() ?? [];
-    const shouldEnable = audioTracks.some((track) => !track.enabled);
-
-    for (const track of audioTracks) {
-      track.enabled = shouldEnable;
-    }
-
-    setMicrophoneStatus(shouldEnable ? "Ready" : "Muted");
-
-    if (!shouldEnable) {
-      stopSpeechRecognition();
-    } else {
-      void resumeAudioDetection();
-    }
-  }, [resumeAudioDetection, stopSpeechRecognition]);
-
-  const startRecording = useCallback(async () => {
-    await resumeAudioDetection();
-
-    let stream = streamRef.current;
-
-    if (!stream) {
-      setError("Camera and microphone are not ready yet.");
-      return;
-    }
-
-    if (!window.MediaRecorder) {
-      setError("This browser does not support session recording.");
-      return;
-    }
-
-    if (recordingUrl) {
-      URL.revokeObjectURL(recordingUrl);
-      setRecordingUrl("");
-    }
-
-    let videoTracks = stream
-      .getVideoTracks()
-      .filter((track) => track.readyState === "live");
-    let audioStream = audioStreamRef.current;
-    let audioTracks = (audioStream?.getAudioTracks() ?? [])
-      .filter((track) => track.readyState === "live");
-
-    if (videoTracks.length === 0 || audioTracks.length === 0) {
-      try {
-        if (videoTracks.length === 0) {
-          const refreshedStream = await getMediaStream();
-          await applyMediaStream(refreshedStream);
-          stream = refreshedStream;
-          videoTracks = stream
-            .getVideoTracks()
-            .filter((track) => track.readyState === "live");
-        }
-
-        if (audioTracks.length === 0) {
-          audioStream = await refreshAudioStream(selectedAudioDeviceId);
-          audioTracks = audioStream
-            .getAudioTracks()
-            .filter((track) => track.readyState === "live");
-        }
-      } catch {
-        setError("Unable to refresh camera and microphone before recording.");
-        return;
-      }
-    }
-
-    if (videoTracks.length === 0) {
-      setError("Recording cannot start because no live camera track was found.");
-      return;
-    }
-
-    if (audioTracks.length === 0) {
-      setError("Recording cannot start because no live microphone track was found.");
-      setRecordingAudioStatus("No audio track");
-      return;
-    }
-
-    for (const audioTrack of audioTracks) {
-      audioTrack.enabled = true;
-    }
-
-    const recordingStream = new MediaStream([
-      ...videoTracks,
-      ...audioTracks,
-    ]);
-    const preferredTypes = [
-      "video/webm;codecs=vp9,opus",
-      "video/webm;codecs=vp8,opus",
-      "video/webm",
-    ];
-    const mimeType =
-      preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
-    const recorder = new MediaRecorder(
-      recordingStream,
-      mimeType ? { mimeType } : undefined,
-    );
-
-    recordedChunksRef.current = [];
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        recordedChunksRef.current.push(event.data);
-      }
-    };
-    recorder.onstop = () => {
-      const blob = new Blob(recordedChunksRef.current, {
-        type: recorder.mimeType || "video/webm",
-      });
-      setRecordingMimeType(blob.type);
-      setRecordingUrl(URL.createObjectURL(blob));
-      setIsRecording(false);
-      setRecordingAudioStatus(
-        audioTracks.length > 0 ? "Audio track recorded" : "No audio track",
-      );
-    };
-    recorder.onerror = () => {
-      setError("Recording failed while capturing camera or microphone.");
-      setIsRecording(false);
-      setRecordingAudioStatus("Recording failed");
-    };
-
-    mediaRecorderRef.current = recorder;
-    setError("");
-    setCommunicationResult(null);
-    setRecordingAudioStatus(
-      `Recording ${audioTracks.length} audio track${audioTracks.length === 1 ? "" : "s"}`,
-    );
-    recorder.start(1000);
-    setIsRecording(true);
-    startSpeechRecognition();
-  }, [
-    applyMediaStream,
-    getMediaStream,
-    recordingUrl,
-    refreshAudioStream,
-    resumeAudioDetection,
-    selectedAudioDeviceId,
-    startSpeechRecognition,
-  ]);
-
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current?.state === "recording") {
-      mediaRecorderRef.current.stop();
-    }
-
-    stopSpeechRecognition();
-    setIsRecording(false);
-  }, [stopSpeechRecognition]);
 
   const analyzeExpression = useCallback(async () => {
     if (!hasFace) {
@@ -1546,67 +1353,24 @@ export default function FaceExpressionAnalyzer() {
               </h1>
             </div>
 
-    setIsAnalyzingCommunication(true);
-    setError("");
-    setCommunicationResult(null);
-
-    try {
-      const response = await fetch("/api/analyze-communication", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          scores: latestScoresRef.current,
-          samples: scoreHistoryRef.current,
-          expressionResult: result,
-          transcript: `${transcript} ${interimTranscript}`.trim(),
-        }),
-      });
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error ?? "Communication analysis failed.");
-      }
-
-      setCommunicationResult(data as CommunicationResult);
-    } catch (communicationError) {
-      setError(
-        communicationError instanceof Error
-          ? communicationError.message
-          : "Unable to analyze communication.",
-      );
-    } finally {
-      setIsAnalyzingCommunication(false);
-    }
-  }, [interimTranscript, result, transcript]);
-
-  const clearSession = useCallback(() => {
-    if (recordingUrl) {
-      URL.revokeObjectURL(recordingUrl);
-    }
-
-    setRecordingUrl("");
-    setRecordingMimeType("");
-    setRecordingAudioStatus("Not recording");
-    setTranscript("");
-    setInterimTranscript("");
-    setCommunicationResult(null);
-  }, [recordingUrl]);
-
-  return (
-    <section className="min-h-0 flex-1 md:h-[calc(100vh-112px)]">
-      <div className="grid h-full min-h-0 gap-3 md:grid-cols-[minmax(0,1.6fr)_minmax(330px,0.75fr)]">
-        <div className="flex min-h-[420px] flex-col overflow-hidden border border-cyan-200/20 bg-[#080b12]/90 p-3 shadow-[0_0_56px_rgba(20,184,166,0.12)] backdrop-blur md:min-h-0">
-          <div className="mb-3 grid shrink-0 grid-cols-2 gap-2 xl:grid-cols-5">
-            <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
-            <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
-            <Metric label="Signal" value={clampPercent(signalStrength)} />
-            <Metric
-              label="Audio"
-              value={hasAudioSignal ? "Signal detected" : microphoneStatus}
-            />
-            <Metric label="Window" value={`${sampleCount} samples`} />
+            <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3 xl:grid-cols-6">
+              <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
+              <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
+              <Metric label="Signal" value={clampPercent(signalStrength)} />
+              <Metric label="Window" value={`${sampleCount} samples`} />
+              <Metric
+                label="Quality"
+                value={clampPercent(visionMetrics?.frameMetrics.qualityScore ?? 0)}
+              />
+              <Metric
+                label="Pose"
+                value={
+                  visionMetrics?.headPose.matrixAvailable
+                    ? `${Math.round(visionMetrics.headPose.yaw)}deg`
+                    : "Pending"
+                }
+              />
+            </div>
           </div>
 
           <div className="relative min-h-[260px] flex-1 overflow-hidden border border-cyan-100/30 bg-black shadow-[inset_0_0_80px_rgba(8,145,178,0.16)] md:min-h-0">
@@ -1617,10 +1381,10 @@ export default function FaceExpressionAnalyzer() {
               playsInline
               autoPlay
             />
-            <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(34,211,238,0.08)_1px,transparent_1px),linear-gradient(0deg,rgba(34,211,238,0.07)_1px,transparent_1px)] bg-[size:42px_42px]" />
-            <div className="pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-b from-cyan-300/12 to-transparent" />
-            <div className="pointer-events-none absolute bottom-3 left-3 border border-cyan-200/25 bg-black/55 px-3 py-2 text-[11px] uppercase tracking-[0.26em] text-cyan-100/75 backdrop-blur">
-              Live Expression + Voice Session
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,rgba(34,211,238,0.12),transparent_34%),linear-gradient(90deg,rgba(34,211,238,0.09)_1px,transparent_1px),linear-gradient(0deg,rgba(34,211,238,0.08)_1px,transparent_1px)] bg-[size:100%_100%,54px_54px,54px_54px]" />
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-cyan-300/16 to-transparent" />
+            <div className="pointer-events-none absolute bottom-4 left-4 border border-cyan-200/30 bg-black/60 px-4 py-2 text-[11px] uppercase tracking-[0.28em] text-cyan-100/80 backdrop-blur">
+              Expanded Vision Telemetry
             </div>
           </div>
 
@@ -1746,28 +1510,31 @@ export default function FaceExpressionAnalyzer() {
               Visible Expression
             </h2>
 
-            <button
-              type="button"
-              onClick={analyzeExpression}
-              disabled={!hasFace || isAnalyzing}
-              className="mt-3 h-12 w-full border border-cyan-100/40 bg-cyan-100 px-5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
-            >
-              {isAnalyzing ? "Interpreting..." : "Analyze"}
-            </button>
-
-            <button
-              type="button"
-              onClick={analyzeCommunication}
-              disabled={
-                isAnalyzingCommunication ||
-                (!transcript.trim() && !interimTranscript.trim())
-              }
-              className="mt-2 h-12 w-full border border-violet-100/35 bg-violet-200 px-5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
-            >
-              {isAnalyzingCommunication
-                ? "Reading Communication..."
-                : "Analyze Communication"}
-            </button>
+            <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
+              <button
+                type="button"
+                onClick={analyzeExpression}
+                disabled={!hasFace || isAnalyzing}
+                className="h-12 border border-cyan-100/40 bg-cyan-100 px-5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500 xl:h-14 xl:px-6"
+              >
+                {isAnalyzing ? "Interpreting..." : "Analyze"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsReportOpen(true);
+                  setHasViewedReport(true);
+                }}
+                disabled={!result || isAnalyzing}
+                className={`h-12 border px-4 text-sm font-semibold transition disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-slate-900/60 disabled:text-slate-600 xl:h-14 xl:px-5 ${
+                  hasViewedReport
+                    ? "border-emerald-200/40 bg-emerald-200/10 text-emerald-50 shadow-[0_0_24px_rgba(16,185,129,0.12)] hover:border-emerald-100 hover:bg-emerald-200/15"
+                    : "border-violet-200/35 bg-violet-200/10 text-violet-50 hover:border-violet-100 hover:bg-violet-200/20"
+                }`}
+              >
+                {hasViewedReport ? "Viewed" : "Report"}
+              </button>
+            </div>
 
             <button
               type="button"
@@ -1993,106 +1760,106 @@ function DetailedReport({
                     <span className="font-semibold text-cyan-50">
                       {EXPRESSION_LABELS[alternative.expression]}
                     </span>
-                    <span className="mt-1 block font-semibold text-amber-100">
-                      {EXPRESSION_LABELS[communicationResult.audioContentExpression]}
+                    <span className="font-mono text-cyan-100">
+                      {formatConfidence(alternative.confidence)}
                     </span>
                   </div>
-                  <div className="border border-white/10 bg-black/20 p-2">
-                    <span className="block uppercase tracking-[0.18em] text-slate-500">
-                      Face Cues
-                    </span>
-                    <span className="mt-1 block font-semibold text-cyan-100">
-                      {EXPRESSION_LABELS[communicationResult.visibleExpression]}
-                    </span>
-                  </div>
-                  <div className="border border-white/10 bg-black/20 p-2">
-                    <span className="block uppercase tracking-[0.18em] text-slate-500">
-                      Final Expression
-                    </span>
-                    <span className="mt-1 block font-semibold text-violet-100">
-                      {EXPRESSION_LABELS[communicationResult.finalExpression]}
-                    </span>
-                  </div>
-                </div>
-                <div className="mt-3 grid gap-1.5 text-xs">
-                  {Object.entries(communicationResult.combinedExpressionScores).map(
-                    ([expression, score]) => (
-                      <div key={expression}>
-                        <div className="mb-1 flex items-center justify-between gap-3">
-                          <span className="text-slate-300">
-                            {EXPRESSION_LABELS[expression as AnalysisResult["expression"]]}
-                          </span>
-                          <span className="font-mono text-violet-100">
-                            {Math.round(score * 100)}%
-                          </span>
-                        </div>
-                        <div className="h-1.5 bg-white/10">
-                          <div
-                            className="h-full bg-violet-200"
-                            style={{ width: clampPercent(score) }}
-                          />
-                        </div>
-                      </div>
-                    ),
-                  )}
-                </div>
-                <p className="mt-2 text-sm leading-6 text-slate-200">
-                  {communicationResult.summary}
-                </p>
-                <p className="mt-2 text-sm leading-6 text-cyan-100">
-                  {communicationResult.recommendation}
-                </p>
-                <p className="mt-2 text-xs leading-5 text-slate-400">
-                  {communicationResult.warning || COMMUNICATION_WARNING}
-                </p>
-              </div>
-            ) : null}
-          </div>
-
-          <div className="border border-white/10 bg-black/35 p-4 backdrop-blur">
-            <p className="text-[11px] uppercase tracking-[0.32em] text-slate-400">
-              Signal Matrix
-            </p>
-            <div className="mt-3 grid gap-2">
-              {signalRows.slice(0, 4).map((signal) => (
-                <div key={signal.label}>
-                  <div className="mb-1.5 flex items-center justify-between gap-4 text-xs">
-                    <span className="font-medium text-slate-100">
-                      {signal.label}
-                    </span>
-                    <span className="text-slate-500">{signal.detail}</span>
-                  </div>
-                  <div className="h-1.5 bg-white/10">
-                    <div
-                      className="h-full bg-cyan-200"
-                      style={{ width: clampPercent(signal.value) }}
-                    />
-                  </div>
+                  <p className="mt-1 text-xs leading-5 text-slate-400">
+                    {alternative.reason}
+                  </p>
                 </div>
               ))}
             </div>
-            <dl className="mt-4 grid gap-2 text-xs">
-              {topBlendshapes.map(({ key, score }) => (
+          </ReportSection>
+
+          <ReportSection title="Temporal Notes">
+            <BulletList items={result.report.temporalNotes} />
+          </ReportSection>
+
+          <ReportSection title="Signal Highlights">
+            <div className="grid gap-2">
+              {result.report.signalHighlights.map((signal) => (
                 <div
-                  key={key}
-                  className="grid grid-cols-[1fr_auto] gap-4 border-b border-white/10 pb-2 last:border-b-0 last:pb-0"
+                  key={`${signal.name}-${signal.note}`}
+                  className="grid grid-cols-[1fr_auto] gap-3 border-b border-white/10 pb-2 last:border-b-0 last:pb-0"
                 >
-                  <dt>
-                    <span className="block font-medium text-slate-100">
-                      {BLENDSHAPE_LABELS[key]}
-                    </span>
-                    <span className="text-slate-500">{key}</span>
-                  </dt>
-                  <dd className="font-mono text-cyan-100">
-                    {score.toFixed(3)}
-                  </dd>
+                  <div>
+                    <p className="text-xs font-semibold text-slate-100">
+                      {getSignalLabel(signal.name)}
+                    </p>
+                    <p className="text-xs leading-5 text-slate-500">
+                      {signal.note}
+                    </p>
+                  </div>
+                  <span className="font-mono text-xs text-cyan-100">
+                    {signal.score.toFixed(3)}
+                  </span>
                 </div>
               ))}
-            </dl>
-          </div>
+            </div>
+          </ReportSection>
         </div>
       </div>
-    </section>
+    </div>
+  );
+}
+
+function SignalMatrix({ signalRows }: { signalRows: SignalRow[] }) {
+  return (
+    <div className="flex min-h-[260px] flex-col overflow-hidden border border-amber-200/20 bg-[#15110b]/95 p-4 shadow-[0_0_50px_rgba(251,191,36,0.08)] backdrop-blur md:min-h-0 xl:p-5">
+      <p className="shrink-0 text-[11px] uppercase tracking-[0.32em] text-amber-200/70">
+        Signal Matrix
+      </p>
+      <div className="mt-3 grid min-h-0 flex-1 gap-3 overflow-y-auto pr-1 xl:mt-4 xl:gap-4">
+        {signalRows.map((signal) => (
+          <div key={signal.label}>
+            <div className="mb-1.5 flex items-center justify-between gap-4 text-xs">
+              <span className="font-medium text-amber-50">{signal.label}</span>
+              <span className="text-slate-400">{signal.detail}</span>
+            </div>
+            <div className="h-1.5 bg-white/10">
+              <div
+                className="h-full bg-amber-200"
+                style={{ width: clampPercent(signal.value) }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReportSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mt-3">
+      <p className="mb-2 text-[10px] uppercase tracking-[0.24em] text-cyan-100/55">
+        {title}
+      </p>
+      {children}
+    </div>
+  );
+}
+
+function BulletList({ items }: { items: string[] }) {
+  if (items.length === 0) {
+    return <p className="text-xs text-slate-500">No strong counter-signal.</p>;
+  }
+
+  return (
+    <ul className="grid gap-1.5 text-xs leading-5 text-slate-300">
+      {items.map((item) => (
+        <li key={item} className="border-l border-cyan-100/20 pl-2">
+          {item}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -2106,5 +1873,3 @@ function Metric({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
-
-
