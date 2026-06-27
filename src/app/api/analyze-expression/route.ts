@@ -17,6 +17,8 @@ const SCORE_KEYS = [
 const EXPRESSIONS = [
   "happy",
   "neutral",
+  "focused",
+  "serious",
   "sad",
   "angry",
   "surprised",
@@ -29,10 +31,14 @@ const WARNING =
 
 type ScoreKey = (typeof SCORE_KEYS)[number];
 type Scores = Record<ScoreKey, number>;
+type NumericScores = Record<string, number>;
 type Expression = (typeof EXPRESSIONS)[number];
+
 type ScoreSample = {
   timestamp: number;
   scores: Scores;
+  allScores: NumericScores;
+  visionMetrics: unknown;
 };
 
 type ScoreStats = {
@@ -64,11 +70,33 @@ type TemporalFeatures = {
   };
 };
 
+type ReportAlternative = {
+  expression: Expression;
+  confidence: number;
+  reason: string;
+};
+
+type SignalHighlight = {
+  name: string;
+  score: number;
+  note: string;
+};
+
+type ExpressionReport = {
+  summary: string;
+  primaryCues: string[];
+  counterSignals: string[];
+  alternatives: ReportAlternative[];
+  temporalNotes: string[];
+  signalHighlights: SignalHighlight[];
+};
+
 type AnalysisResponse = {
   expression: Expression;
   confidence: number;
   reason: string;
   warning: string;
+  report: ExpressionReport;
 };
 
 type DerivedFeatures = {
@@ -121,9 +149,71 @@ function normalizeScores(value: unknown): Scores | null {
   return scores;
 }
 
-function normalizeScoreSamples(value: unknown, fallbackScores: Scores) {
+function normalizeNumericScores(value: unknown, fallback: NumericScores = {}) {
+  if (!isRecord(value)) {
+    return fallback;
+  }
+
+  const scores: NumericScores = {};
+
+  for (const [key, score] of Object.entries(value)) {
+    if (typeof score === "number" && Number.isFinite(score)) {
+      scores[key] = Math.max(0, Math.min(1, score));
+    }
+  }
+
+  return Object.keys(scores).length > 0 ? scores : fallback;
+}
+
+function sanitizeJsonValue(value: unknown, depth = 0): unknown {
+  if (depth > 4) {
+    return undefined;
+  }
+
+  if (
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : undefined;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => sanitizeJsonValue(item, depth + 1))
+      .filter((item) => item !== undefined)
+      .slice(0, 80);
+  }
+
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .map(([key, item]) => [key, sanitizeJsonValue(item, depth + 1)])
+        .filter(([, item]) => item !== undefined),
+    );
+  }
+
+  return undefined;
+}
+
+function normalizeScoreSamples(
+  value: unknown,
+  fallbackScores: Scores,
+  fallbackAllScores: NumericScores,
+) {
   if (!Array.isArray(value)) {
-    return [{ timestamp: 0, scores: fallbackScores }];
+    return [
+      {
+        timestamp: 0,
+        scores: fallbackScores,
+        allScores: fallbackAllScores,
+        visionMetrics: null,
+      },
+    ];
   }
 
   const samples: ScoreSample[] = [];
@@ -139,28 +229,47 @@ function normalizeScoreSamples(value: unknown, fallbackScores: Scores) {
       continue;
     }
 
+    const allScores = normalizeNumericScores(item.allScores, fallbackScores);
+
     samples.push({
       timestamp: item.timestamp,
       scores,
+      allScores,
+      visionMetrics: sanitizeJsonValue(item.visionMetrics) ?? null,
     });
   }
 
   if (samples.length === 0) {
-    return [{ timestamp: 0, scores: fallbackScores }];
+    return [
+      {
+        timestamp: 0,
+        scores: fallbackScores,
+        allScores: fallbackAllScores,
+        visionMetrics: null,
+      },
+    ];
   }
 
   const sortedSamples = samples
     .sort((left, right) => left.timestamp - right.timestamp)
     .slice(-MAX_SCORE_SAMPLES);
   const latestTimestamp =
-    sortedSamples[sortedSamples.length - 1]?.timestamp ?? sortedSamples[0].timestamp;
+    sortedSamples[sortedSamples.length - 1]?.timestamp ??
+    sortedSamples[0].timestamp;
   const windowedSamples = sortedSamples.filter(
     (sample) => latestTimestamp - sample.timestamp <= MAX_SAMPLE_WINDOW_MS,
   );
 
   return windowedSamples.length > 0
     ? windowedSamples
-    : [{ timestamp: 0, scores: fallbackScores }];
+    : [
+        {
+          timestamp: 0,
+          scores: fallbackScores,
+          allScores: fallbackAllScores,
+          visionMetrics: null,
+        },
+      ];
 }
 
 function clampConfidence(value: unknown) {
@@ -196,7 +305,8 @@ function getMean(values: number[]) {
 function getVolatility(values: number[]) {
   const mean = getMean(values);
   const variance =
-    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+    values.length;
 
   return Math.sqrt(variance);
 }
@@ -218,18 +328,29 @@ function getAngryTensionIndex(scores: Scores) {
   const frownAverage = average(scores.mouthFrownLeft, scores.mouthFrownRight);
   const browTension = average(scores.browDownLeft, scores.browDownRight);
   const eyeNarrowing = average(scores.eyeSquintLeft, scores.eyeSquintRight);
-  const lowSmile = 1 - Math.max(0, Math.min(1, smileAverage));
+  const browCore = normalizeRange(browTension, 0.12, 0.44);
+  const eyeCore = normalizeRange(eyeNarrowing, 0.1, 0.4);
+  const frownCore = normalizeRange(frownAverage, 0.1, 0.42);
+  const lowSmileWeakCue = normalizeRange(0.24 - smileAverage, 0, 0.24);
+  const jawOpen = normalizeRange(scores.jawOpen, 0.18, 0.56);
+  const innerBrowLift = normalizeRange(scores.browInnerUp, 0.16, 0.48);
+  const browEyeAgreement = Math.min(browCore, eyeCore);
   const synergy =
-    browTension > 0.24 && eyeNarrowing > 0.18 && smileAverage < 0.24
-      ? 0.22
+    browTension > 0.26 &&
+    eyeNarrowing > 0.2 &&
+    (frownAverage > 0.14 || smileAverage < 0.12)
+      ? 0.14
       : 0;
 
   return clamp01(
-    browTension * 0.42 +
-      eyeNarrowing * 0.28 +
-      frownAverage * 0.18 +
-      lowSmile * 0.1 +
-      synergy,
+    browEyeAgreement * 0.46 +
+      browCore * 0.22 +
+      eyeCore * 0.18 +
+      frownCore * 0.2 +
+      lowSmileWeakCue * 0.04 +
+      synergy -
+      jawOpen * 0.1 -
+      innerBrowLift * 0.08,
   );
 }
 
@@ -268,7 +389,9 @@ function getTemporalFeatures(samples: ScoreSample[]): TemporalFeatures {
   ) as Scores;
   const firstTimestamp = samples[0]?.timestamp ?? 0;
   const lastTimestamp = samples[samples.length - 1]?.timestamp ?? firstTimestamp;
-  const angrySeries = samples.map((sample) => getAngryTensionIndex(sample.scores));
+  const angrySeries = samples.map((sample) =>
+    getAngryTensionIndex(sample.scores),
+  );
   const smileSeries = samples.map((sample) =>
     average(sample.scores.mouthSmileLeft, sample.scores.mouthSmileRight),
   );
@@ -292,7 +415,8 @@ function getTemporalFeatures(samples: ScoreSample[]): TemporalFeatures {
       angryTensionPeak: roundScore(Math.max(...angrySeries)),
       angryTensionTrend: roundScore(getWindowTrend(angrySeries)),
       angryTensionStableRatio: roundScore(
-        angrySeries.filter((value) => value >= 0.45).length / angrySeries.length,
+        angrySeries.filter((value) => value >= 0.45).length /
+          angrySeries.length,
       ),
       smileMean: roundScore(getMean(smileSeries)),
       smilePeak: roundScore(Math.max(...smileSeries)),
@@ -321,30 +445,88 @@ function getExpressionScores(params: {
   const innerBrow = normalizeRange(params.innerBrowLift, 0.12, 0.45);
   const activation = normalizeRange(params.activationLevel, 0.1, 0.45);
   const lowSmile = 1 - smile;
+  const lowJaw = 1 - jaw;
+  const browEyeAgreement = Math.min(brow, squint);
   const angrySynergy =
-    params.browTension > 0.24 &&
-    params.eyeNarrowing > 0.18 &&
-    params.smileAverage < 0.24
-      ? 0.22
+    params.browTension > 0.26 &&
+    params.eyeNarrowing > 0.2 &&
+    (params.frownAverage > 0.14 || params.smileAverage < 0.12)
+      ? 0.16
       : 0;
 
   return {
     happy: roundScore(
-      clamp01(0.72 * smile + 0.12 * squint + 0.1 * activation - 0.22 * frown - 0.18 * brow),
+      clamp01(
+        0.72 * smile +
+          0.12 * squint +
+          0.1 * activation -
+          0.22 * frown -
+          0.18 * brow,
+      ),
+    ),
+    neutral: roundScore(
+      clamp01(1 - normalizeRange(params.activationLevel, 0.08, 0.32)),
+    ),
+    focused: roundScore(
+      clamp01(
+        0.34 * squint +
+          0.24 * lowSmile +
+          0.18 * lowJaw +
+          0.16 * activation -
+          0.16 * frown -
+          0.14 * innerBrow,
+      ),
+    ),
+    serious: roundScore(
+      clamp01(
+        0.28 * lowSmile +
+          0.22 * frown +
+          0.2 * brow +
+          0.14 * lowJaw -
+          0.18 * smile -
+          0.12 * jaw,
+      ),
     ),
     sad: roundScore(
-      clamp01(0.42 * frown + 0.35 * innerBrow + 0.16 * lowSmile - 0.12 * brow - 0.08 * smile),
+      clamp01(
+        0.42 * frown +
+          0.35 * innerBrow +
+          0.16 * lowSmile -
+          0.12 * brow -
+          0.08 * smile,
+      ),
     ),
     angry: roundScore(
-      clamp01(0.42 * brow + 0.28 * squint + 0.18 * frown + 0.1 * lowSmile + angrySynergy - 0.16 * smile),
+      clamp01(
+        0.36 * browEyeAgreement +
+          0.22 * brow +
+          0.18 * squint +
+          0.2 * frown +
+          0.04 * lowSmile +
+          angrySynergy -
+          0.16 * smile -
+          0.1 * innerBrow -
+          0.1 * jaw,
+      ),
     ),
     surprised: roundScore(
-      clamp01(0.46 * jaw + 0.34 * innerBrow + 0.12 * lowSmile - 0.16 * squint - 0.12 * brow),
+      clamp01(
+        0.46 * jaw +
+          0.34 * innerBrow +
+          0.12 * lowSmile -
+          0.16 * squint -
+          0.12 * brow,
+      ),
     ),
     tired: roundScore(
-      clamp01(0.42 * squint + 0.18 * innerBrow + 0.16 * lowSmile - 0.18 * brow - 0.12 * jaw),
+      clamp01(
+        0.42 * squint +
+          0.18 * innerBrow +
+          0.16 * lowSmile -
+          0.18 * brow -
+          0.12 * jaw,
+      ),
     ),
-    neutral: roundScore(clamp01(1 - normalizeRange(params.activationLevel, 0.08, 0.32))),
     unclear: 0,
   } satisfies Record<Expression, number>;
 }
@@ -365,7 +547,9 @@ function getHeuristicClassification(
     return {
       expression: "neutral" as const,
       confidence: 0.72,
-      evidence: ["整体表情激活度很低，优先视为可见中性表情"],
+      evidence: [
+        "Overall visible activation is very low, so neutral is favored.",
+      ],
     };
   }
 
@@ -374,7 +558,7 @@ function getHeuristicClassification(
       expression: "unclear" as const,
       confidence: roundScore(0.35 + topScore * 0.25),
       evidence: [
-        "最高候选分数不高或候选之间差距很小，表情信号冲突",
+        "The leading expression score is weak or close to another candidate.",
         ...evidence.slice(0, 3),
       ],
     };
@@ -419,37 +603,43 @@ function getDerivedFeatures(scores: Scores, samples: ScoreSample[]): DerivedFeat
 
   if (smileAverage > 0.35 && frownAverage < 0.2) {
     heuristicHints.push("smile-dominant visible expression");
-    evidence.push("左右嘴角上扬均值较高，且嘴角下压信号较低");
+    evidence.push("Smile scores are high while mouth-frown scores are low.");
   }
 
   if (frownAverage > 0.25 || featureScores.browInnerUp > 0.35) {
     heuristicHints.push("downturned mouth or raised inner brow signal");
-    evidence.push("嘴角下压或内眉抬起较明显");
+    evidence.push("Mouth-frown or inner-brow lift is visible.");
   }
 
   if (browTension > 0.25 && eyeNarrowing > 0.2) {
     heuristicHints.push("brow tension with narrowed eyes");
-    evidence.push("眉部压低和眼部收窄同时升高，是生气/紧绷类可见信号");
+    evidence.push("Brow-down and eye-squint scores are elevated together.");
   }
 
-  if (browTension > 0.32 && eyeNarrowing > 0.22 && smileAverage < 0.24) {
+  if (
+    browTension > 0.32 &&
+    eyeNarrowing > 0.22 &&
+    (frownAverage > 0.14 || smileAverage < 0.12)
+  ) {
     heuristicHints.push("strong angry-like tension pattern");
-    evidence.push("眉压低强、眼收窄明显、微笑信号弱，符合 angry-like tension 组合");
+    evidence.push(
+      "Strong brow-down and eye-squint appear with frown or mouth tension.",
+    );
   }
 
   if (frownAverage > 0.2 && smileAverage < 0.18 && browTension > 0.2) {
     heuristicHints.push("frown plus brow tension without smile");
-    evidence.push("嘴角下压叠加眉部压低，同时缺少嘴角上扬");
+    evidence.push("Mouth-frown combines with brow tension and low smile.");
   }
 
   if (featureScores.jawOpen > 0.28 && featureScores.browInnerUp > 0.2) {
     heuristicHints.push("open jaw with raised inner brow");
-    evidence.push("下颌张开和内眉抬起同时出现，可能偏惊讶");
+    evidence.push("Open jaw and raised inner brow point toward surprise.");
   }
 
   if (activationLevel < 0.18) {
     heuristicHints.push("low activation; prefer neutral or unclear");
-    evidence.push("整体激活度较低，应降低非中性表情置信度");
+    evidence.push("Overall activation is low; non-neutral confidence is reduced.");
   }
 
   if (
@@ -458,13 +648,13 @@ function getDerivedFeatures(scores: Scores, samples: ScoreSample[]): DerivedFeat
   ) {
     heuristicHints.push("temporally stable angry-like tension");
     evidence.push(
-      "最近时间窗口内 angry/tension 指数持续偏高，而不是单帧尖峰",
+      "Angry/tension index stays elevated across the recent time window.",
     );
   }
 
   if (temporalFeatures.aggregate.angryTensionTrend > 0.12) {
     heuristicHints.push("rising angry-like tension trend");
-    evidence.push("最近几秒 angry/tension 指数呈上升趋势");
+    evidence.push("Angry/tension index is rising in the recent window.");
   }
 
   const expressionScores = getExpressionScores({
@@ -479,10 +669,10 @@ function getDerivedFeatures(scores: Scores, samples: ScoreSample[]): DerivedFeat
 
   expressionScores.angry = roundScore(
     clamp01(
-      expressionScores.angry * 0.72 +
-        temporalFeatures.aggregate.angryTensionMean * 0.18 +
-        temporalFeatures.aggregate.angryTensionStableRatio * 0.18 +
-        Math.max(0, temporalFeatures.aggregate.angryTensionTrend) * 0.3,
+      expressionScores.angry * 0.78 +
+        temporalFeatures.aggregate.angryTensionMean * 0.14 +
+        temporalFeatures.aggregate.angryTensionStableRatio * 0.08 +
+        Math.max(0, temporalFeatures.aggregate.angryTensionTrend) * 0.2,
     ),
   );
 
@@ -515,46 +705,108 @@ function getDerivedFeatures(scores: Scores, samples: ScoreSample[]): DerivedFeat
   };
 }
 
-function maybeApplyRuleCorrection(
-  analysis: AnalysisResponse,
-  derivedFeatures: DerivedFeatures,
-): AnalysisResponse {
-  const heuristic = derivedFeatures.heuristicClassification;
-  const temporalAngry =
-    derivedFeatures.temporalFeatures.aggregate.angryTensionMean >= 0.48 &&
-    derivedFeatures.temporalFeatures.aggregate.angryTensionStableRatio >= 0.35;
-  const peakAngry =
-    derivedFeatures.temporalFeatures.aggregate.angryTensionPeak >= 0.72 &&
-    derivedFeatures.expressionScores.angry >= 0.58;
+function getVisibleEvidenceSummary(derivedFeatures: DerivedFeatures) {
+  const aggregate = derivedFeatures.temporalFeatures.aggregate;
 
-  if (
-    ((heuristic.expression === "angry" && heuristic.confidence >= 0.62) ||
-      temporalAngry ||
-      peakAngry) &&
-    analysis.expression !== "angry"
-  ) {
-    return {
-      expression: "angry",
-      confidence: Math.max(analysis.confidence, heuristic.confidence, 0.72),
-      reason: `规则层检测到更强的可见生气/紧绷组合：${heuristic.evidence.join("；")}。时间窗口 angry/tension 均值=${derivedFeatures.temporalFeatures.aggregate.angryTensionMean}，峰值=${derivedFeatures.temporalFeatures.aggregate.angryTensionPeak}，稳定比例=${derivedFeatures.temporalFeatures.aggregate.angryTensionStableRatio}。因此相较于模型原始候选 ${analysis.expression}，当前更适合标记为 angry-like visible expression。`,
-      warning: WARNING,
-    };
+  return [
+    `smile=${derivedFeatures.smileAverage}`,
+    `frown=${derivedFeatures.frownAverage}`,
+    `browDown=${derivedFeatures.browTension}`,
+    `eyeSquint=${derivedFeatures.eyeNarrowing}`,
+    `jawOpen=${derivedFeatures.jawOpening}`,
+    `browInnerUp=${derivedFeatures.innerBrowLift}`,
+    `angryTensionMean=${aggregate.angryTensionMean}`,
+    `angryTensionStableRatio=${aggregate.angryTensionStableRatio}`,
+  ];
+}
+
+function getModelDerivedFeatures(derivedFeatures: DerivedFeatures) {
+  return {
+    ...derivedFeatures,
+    heuristicClassification: {
+      ...derivedFeatures.heuristicClassification,
+      evidence: getVisibleEvidenceSummary(derivedFeatures),
+    },
+    analysisMode:
+      "OpenAI is the final classifier. Local scores and heuristics are descriptive context only.",
+    reportInstructions: {
+      summary:
+        "Provide a careful visible-expression report without claiming true mood.",
+      alternatives:
+        "Compare the main result against plausible alternatives such as focused, serious, tired, angry, sad, surprised, neutral, and unclear.",
+    },
+  };
+}
+
+function getString(value: unknown, fallback: string) {
+  return typeof value === "string" && value.trim().length > 0
+    ? value
+    : fallback;
+}
+
+function getStringArray(value: unknown, fallback: string[], maxItems = 6) {
+  if (!Array.isArray(value)) {
+    return fallback;
   }
 
-  if (
-    heuristic.expression !== "unclear" &&
-    heuristic.confidence >= 0.74 &&
-    analysis.expression === "unclear"
-  ) {
-    return {
-      expression: heuristic.expression,
-      confidence: heuristic.confidence,
-      reason: `规则层给出了更稳定的可见表情候选：${heuristic.evidence.join("；")}。`,
-      warning: WARNING,
-    };
+  const strings = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, maxItems);
+
+  return strings.length > 0 ? strings : fallback;
+}
+
+function getExpression(value: unknown): Expression {
+  return EXPRESSIONS.includes(value as Expression)
+    ? (value as Expression)
+    : "unclear";
+}
+
+function getReportAlternatives(value: unknown): ReportAlternative[] {
+  if (!Array.isArray(value)) {
+    return [];
   }
 
-  return analysis;
+  return value
+    .filter(isRecord)
+    .map((item) => ({
+      expression: getExpression(item.expression),
+      confidence: clampConfidence(item.confidence),
+      reason: getString(item.reason, "No alternative reason provided."),
+    }))
+    .slice(0, 4);
+}
+
+function getSignalHighlights(value: unknown): SignalHighlight[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(isRecord)
+    .map((item) => {
+      return {
+        name: getString(item.name, "unknownSignal"),
+        score: clampConfidence(item.score),
+        note: getString(item.note, "Visible score contributed to the report."),
+      };
+    })
+    .slice(0, 6);
+}
+
+function normalizeReport(value: unknown, reason: string): ExpressionReport {
+  const report = isRecord(value) ? value : {};
+
+  return {
+    summary: getString(report.summary, reason),
+    primaryCues: getStringArray(report.primaryCues, [reason], 5),
+    counterSignals: getStringArray(report.counterSignals, [], 4),
+    alternatives: getReportAlternatives(report.alternatives),
+    temporalNotes: getStringArray(report.temporalNotes, [], 3),
+    signalHighlights: getSignalHighlights(report.signalHighlights),
+  };
 }
 
 function normalizeAnalysis(value: unknown): AnalysisResponse {
@@ -562,19 +814,18 @@ function normalizeAnalysis(value: unknown): AnalysisResponse {
     throw new Error("OpenAI returned an invalid response.");
   }
 
-  const expression = EXPRESSIONS.includes(value.expression as Expression)
-    ? (value.expression as Expression)
-    : "unclear";
-  const reason =
-    typeof value.reason === "string"
-      ? value.reason
-      : "The visible facial expression scores were unclear.";
+  const expression = getExpression(value.expression);
+  const reason = getString(
+    value.reason,
+    "The visible facial expression scores were unclear.",
+  );
 
   return {
     expression,
     confidence: clampConfidence(value.confidence),
     reason,
     warning: WARNING,
+    report: normalizeReport(value.report, reason),
   };
 }
 
@@ -655,9 +906,17 @@ export async function POST(request: Request) {
     const client = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
     });
+    const allScores = normalizeNumericScores(
+      isRecord(body) ? body.allScores : undefined,
+      scores,
+    );
+    const visionMetrics =
+      sanitizeJsonValue(isRecord(body) ? body.visionMetrics : undefined) ??
+      null;
     const samples = normalizeScoreSamples(
       isRecord(body) ? body.samples : undefined,
       scores,
+      allScores,
     );
     const derivedFeatures = getDerivedFeatures(scores, samples);
 
@@ -667,14 +926,24 @@ export async function POST(request: Request) {
         {
           role: "developer",
           content:
-            "Analyze only the visible facial expression based on the provided MediaPipe face blendshape scores, recent temporal score window, expression score breakdown, heuristic classification, and derived feature summary. Treat the heuristic classification as an expert prior, especially for angry-like visible tension: sustained browDownLeft/browDownRight plus eyeSquintLeft/eyeSquintRight, low smile, and mouth frown should strongly support angry when active together. Prefer temporally stable patterns over one-frame spikes. Compare active and inactive signals, handle conflicting cues, and lower confidence when signals are weak or contradictory. Do not identify the person. Do not infer race, gender, age, health, mental health, or any sensitive attributes. Do not claim to know the user's real mood. Do not diagnose emotional or psychological state. Return strict JSON only with the requested format. Write the reason in Simplified Chinese and mention the most important visible score patterns.",
+            "Analyze only the visible facial expression based on numeric browser-local vision signals: core MediaPipe blendshape scores, complete MediaPipe blendshape scores, landmark-derived geometry, facial transformation matrix head-pose estimates, local frame quality metrics, recent temporal samples, expression score breakdown, heuristic classification, and derived feature summary. You are the final classifier; local heuristic scores are descriptive context, not rules to obey. Return a careful structured report based only on these visible-expression numbers. Focused and serious are allowed labels, and should be used when a face looks concentrated, stern, or unsmiling without enough evidence for tired, angry, sad, or neutral. Angry can appear through several visible patterns, not only narrowed eyes: brow-down tension, eye narrowing, frown or mouth compression, jaw opening, asymmetry, head pose, and temporal stability may all matter depending on the combination. Do not require one fixed angry template. Do not classify from one isolated cue such as low smile, eye squint, or frown alone; compare active and inactive signals and choose the most plausible visible expression. Use frame quality and face pose to lower confidence when the face is poorly framed, dim, blurry, far away, off-center, or turned. Distinguish angry from tired squint, focused attention, serious unsmiling expression, sad frown plus browInnerUp, and surprised jawOpen plus browInnerUp. Prefer temporally stable patterns over one-frame spikes. Lower confidence when signals are weak or contradictory. Do not identify the person. Do not infer race, gender, age, health, mental health, or any sensitive attributes. Do not claim to know the user's real mood. Do not diagnose emotional or psychological state. Do not mention uploaded images or video; only numeric features were provided. Return strict JSON only with the requested format. Write all report text in English.",
         },
         {
           role: "user",
           content: JSON.stringify({
             scores,
+            allBlendshapeScores: allScores,
+            visionMetrics,
             samples,
-            derivedFeatures,
+            derivedFeatures: getModelDerivedFeatures(derivedFeatures),
+            availableSignalGroups: [
+              "core blendshape scores",
+              "complete MediaPipe blendshape scores",
+              "landmark-derived geometry metrics",
+              "head pose from facial transformation matrix",
+              "frame quality metrics from local camera pixels",
+              "recent temporal samples",
+            ],
             allowedExpressions: EXPRESSIONS,
             requiredWarning: WARNING,
           }),
@@ -683,7 +952,7 @@ export async function POST(request: Request) {
       response_format: {
         type: "json_schema",
         json_schema: {
-          name: "visible_expression_analysis",
+          name: "visible_expression_report",
           strict: true,
           schema: {
             type: "object",
@@ -701,14 +970,106 @@ export async function POST(request: Request) {
               reason: {
                 type: "string",
                 description:
-                  "Short reason based only on visible facial expression scores.",
+                  "One short reason based only on visible facial expression scores.",
               },
               warning: {
                 type: "string",
                 enum: [WARNING],
               },
+              report: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  summary: {
+                    type: "string",
+                    description:
+                      "Concise visible-expression conclusion in one or two sentences.",
+                  },
+                  primaryCues: {
+                    type: "array",
+                    minItems: 2,
+                    maxItems: 5,
+                    items: {
+                      type: "string",
+                    },
+                  },
+                  counterSignals: {
+                    type: "array",
+                    minItems: 1,
+                    maxItems: 4,
+                    items: {
+                      type: "string",
+                    },
+                  },
+                  alternatives: {
+                    type: "array",
+                    minItems: 2,
+                    maxItems: 4,
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        expression: {
+                          type: "string",
+                          enum: EXPRESSIONS,
+                        },
+                        confidence: {
+                          type: "number",
+                          minimum: 0,
+                          maximum: 1,
+                        },
+                        reason: {
+                          type: "string",
+                        },
+                      },
+                      required: ["expression", "confidence", "reason"],
+                    },
+                  },
+                  temporalNotes: {
+                    type: "array",
+                    minItems: 1,
+                    maxItems: 3,
+                    items: {
+                      type: "string",
+                    },
+                  },
+                  signalHighlights: {
+                    type: "array",
+                    minItems: 3,
+                    maxItems: 6,
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        name: {
+                          type: "string",
+                          description:
+                            "Blendshape, landmark-derived, pose, or frame-quality signal name.",
+                        },
+                        score: {
+                          type: "number",
+                          minimum: 0,
+                          maximum: 1,
+                        },
+                        note: {
+                          type: "string",
+                        },
+                      },
+                      required: ["name", "score", "note"],
+                    },
+                  },
+                },
+                required: [
+                  "summary",
+                  "primaryCues",
+                  "counterSignals",
+                  "alternatives",
+                  "temporalNotes",
+                  "signalHighlights",
+                ],
+              },
             },
-            required: ["expression", "confidence", "reason", "warning"],
+            required: ["expression", "confidence", "reason", "warning", "report"],
           },
         },
       },
@@ -720,10 +1081,7 @@ export async function POST(request: Request) {
       throw new Error("OpenAI returned an empty response.");
     }
 
-    const analysis = maybeApplyRuleCorrection(
-      normalizeAnalysis(JSON.parse(content)),
-      derivedFeatures,
-    );
+    const analysis = normalizeAnalysis(JSON.parse(content));
 
     return NextResponse.json(analysis);
   } catch (error: unknown) {
