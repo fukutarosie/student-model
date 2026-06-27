@@ -19,6 +19,7 @@ The goal is to help teachers, presenters, facilitators, or interviewers understa
 - AI-assisted expression interpretation through the server API.
 - Camera and microphone session recording in the browser.
 - Browser speech recognition for participant words.
+- Live microphone signal meter and audio detection settings.
 - Transcript display with interim and final speech text.
 - Combined communication analysis using verbal and non-verbal signals.
 - Public API endpoints protected by a separate API access key.
@@ -71,6 +72,33 @@ http://localhost:3000
 ```
 
 Use Chrome or Microsoft Edge for the best speech recognition support.
+
+## Audio Detection Settings
+
+The app includes an audio detection panel below the camera:
+
+- The audio meter shows live microphone volume from the browser stream.
+- `Signal detected` means the app is receiving microphone input.
+- The microphone selector lets you switch between browser-detected input devices.
+- `Listen Voice` starts speech-to-text transcription.
+- The language selector controls speech recognition language.
+- `Mute Mic` / `Enable Mic` toggles the microphone track without closing the camera.
+- `Test Mic` resumes browser audio detection if the meter is stuck because the browser suspended audio.
+- The transcript box is editable, so you can type or paste participant words if browser speech recognition does not work.
+
+If the transcript does not update:
+
+- First check whether the audio meter moves when you speak.
+- If the meter stays at `0%`, try a different microphone in the app's microphone selector.
+- On some Windows laptops, `Microphone Array (AMD Audio Device)` may appear but stay silent if Windows is using another input device.
+- If the meter stays at `0%`, allow microphone permission in the browser.
+- Check the Windows input device in system sound settings.
+- Use Chrome or Microsoft Edge, because browser speech recognition support varies.
+- Make sure the page is running on `localhost` or HTTPS.
+
+If the meter moves but transcript stays empty, the microphone is working and the issue is likely speech recognition language, browser support, or background noise.
+
+If speech recognition still fails, type the participant words into the transcript box and click `Analyze Communication`. The app can still analyze verbal communication from typed transcript text.
 
 ## Application Flow
 
@@ -192,10 +220,39 @@ Response shape:
 
 ```json
 {
-  "summary": "The participant appears to be asking for clarification.",
+  "summary": "The words express uncertainty, while the visible facial cues are also closer to unclear or concerned concentration.",
   "communicationTone": "uncertain",
   "confidence": 0.74,
   "visibleExpression": "unclear",
+  "audioContentExpression": "unclear",
+  "finalExpression": "unclear",
+  "audioContentScores": {
+    "happy": 0.02,
+    "neutral": 0.2,
+    "sad": 0.12,
+    "angry": 0.04,
+    "surprised": 0.08,
+    "tired": 0.05,
+    "unclear": 0.78
+  },
+  "facialExpressionScores": {
+    "happy": 0.01,
+    "neutral": 0.32,
+    "sad": 0.28,
+    "angry": 0.18,
+    "surprised": 0.12,
+    "tired": 0.16,
+    "unclear": 0
+  },
+  "combinedExpressionScores": {
+    "happy": 0.02,
+    "neutral": 0.25,
+    "sad": 0.18,
+    "angry": 0.1,
+    "surprised": 0.1,
+    "tired": 0.09,
+    "unclear": 0.47
+  },
   "spokenSignals": ["The transcript contains confusion or clarification language."],
   "facialSignals": ["Visible brow or frown signals may suggest concentration."],
   "recommendation": "Pause and restate the next instruction in simpler steps.",

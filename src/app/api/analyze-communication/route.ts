@@ -55,6 +55,11 @@ type CommunicationResponse = {
   communicationTone: CommunicationTone;
   confidence: number;
   visibleExpression: Expression;
+  audioContentExpression: Expression;
+  finalExpression: Expression;
+  audioContentScores: Record<Expression, number>;
+  facialExpressionScores: Record<Expression, number>;
+  combinedExpressionScores: Record<Expression, number>;
   spokenSignals: string[];
   facialSignals: string[];
   recommendation: string;
@@ -177,6 +182,34 @@ function getFacialSummary(samples: ScoreSample[], latestScores: Scores) {
   };
 }
 
+function normalizeRange(value: number, low: number, high: number) {
+  if (high <= low) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(1, (value - low) / (high - low)));
+}
+
+function getFacialExpressionScores(facialSummary: ReturnType<typeof getFacialSummary>) {
+  const smile = normalizeRange(facialSummary.window.smileMean, 0.12, 0.5);
+  const brow = normalizeRange(facialSummary.window.browTensionMean, 0.12, 0.44);
+  const squint = normalizeRange(facialSummary.window.eyeNarrowingMean, 0.1, 0.4);
+  const frown = normalizeRange(facialSummary.window.frownMean, 0.1, 0.42);
+  const jaw = normalizeRange(facialSummary.latest.jawOpen, 0.14, 0.55);
+  const innerBrow = normalizeRange(facialSummary.latest.innerBrowUp, 0.12, 0.45);
+  const activation = Math.max(smile, brow, squint, frown, jaw, innerBrow);
+  const lowSmile = 1 - smile;
+
+  return {
+    happy: round(Math.max(0, Math.min(1, 0.74 * smile + 0.1 * squint - 0.18 * frown - 0.14 * brow))),
+    neutral: round(Math.max(0, Math.min(1, 1 - normalizeRange(activation, 0.08, 0.35)))),
+    sad: round(Math.max(0, Math.min(1, 0.42 * frown + 0.34 * innerBrow + 0.14 * lowSmile - 0.1 * smile))),
+    angry: round(Math.max(0, Math.min(1, 0.42 * brow + 0.28 * squint + 0.18 * frown + 0.08 * lowSmile - 0.12 * smile))),
+    surprised: round(Math.max(0, Math.min(1, 0.46 * jaw + 0.34 * innerBrow + 0.1 * lowSmile - 0.12 * squint))),
+    tired: round(Math.max(0, Math.min(1, 0.42 * squint + 0.18 * innerBrow + 0.16 * lowSmile - 0.14 * jaw))),
+    unclear: 0,
+  } satisfies Record<Expression, number>;
+}
 function getOpenAIErrorMessage(error: unknown) {
   if (!isRecord(error)) {
     return "Unable to analyze communication.";
@@ -206,6 +239,26 @@ function normalizeCommunicationResponse(value: unknown): CommunicationResponse {
     throw new Error("OpenAI returned an invalid communication response.");
   }
 
+  const normalizeExpressionScores = (scores: unknown) => {
+    const output = Object.fromEntries(
+      EXPRESSIONS.map((expression) => [expression, 0]),
+    ) as Record<Expression, number>;
+
+    if (!isRecord(scores)) {
+      return output;
+    }
+
+    for (const expression of EXPRESSIONS) {
+      const score = scores[expression];
+
+      if (typeof score === "number" && Number.isFinite(score)) {
+        output[expression] = Math.max(0, Math.min(1, score));
+      }
+    }
+
+    return output;
+  };
+
   return {
     summary:
       typeof value.summary === "string"
@@ -223,6 +276,19 @@ function normalizeCommunicationResponse(value: unknown): CommunicationResponse {
     visibleExpression: EXPRESSIONS.includes(value.visibleExpression as Expression)
       ? (value.visibleExpression as Expression)
       : "unclear",
+    audioContentExpression: EXPRESSIONS.includes(
+      value.audioContentExpression as Expression,
+    )
+      ? (value.audioContentExpression as Expression)
+      : "unclear",
+    finalExpression: EXPRESSIONS.includes(value.finalExpression as Expression)
+      ? (value.finalExpression as Expression)
+      : "unclear",
+    audioContentScores: normalizeExpressionScores(value.audioContentScores),
+    facialExpressionScores: normalizeExpressionScores(value.facialExpressionScores),
+    combinedExpressionScores: normalizeExpressionScores(
+      value.combinedExpressionScores,
+    ),
     spokenSignals: Array.isArray(value.spokenSignals)
       ? value.spokenSignals
           .filter((signal): signal is string => typeof signal === "string")
@@ -298,6 +364,7 @@ export async function POST(request: Request) {
       isRecord(body) ? body.expressionResult : undefined,
     );
     const facialSummary = getFacialSummary(samples, scores);
+    const facialExpressionScores = getFacialExpressionScores(facialSummary);
     const client = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
     });
@@ -308,7 +375,7 @@ export async function POST(request: Request) {
         {
           role: "developer",
           content:
-            "Analyze classroom or meeting communication using only the participant transcript and visible facial-expression signal summary. Do not identify the person. Do not infer protected or sensitive traits. Do not claim to know real emotions, intent, truthfulness, mental health, or personality. Treat facial signals as weak visible cues and transcript content as the primary communication signal. Return practical, respectful coaching that helps the listener communicate better.",
+            "Analyze classroom or meeting communication using only the participant transcript and visible facial-expression signal summary. Score the transcript/audio content for expressed affect cues across the allowed expressions, then combine those audio-content scores with the provided facial-expression scores to produce a final combined expression. Treat transcript/audio-content cues as 60% of the final score and visible facial cues as 40%, unless transcript content is too short or ambiguous; in that case reduce confidence and prefer unclear/neutral. Do not identify the person. Do not infer protected or sensitive traits. Do not claim to know real emotions, intent, truthfulness, mental health, or personality. Use wording such as expressed by the words and visible cues suggest rather than they feel. Return practical, respectful coaching that helps the listener communicate better.",
         },
         {
           role: "user",
@@ -316,6 +383,8 @@ export async function POST(request: Request) {
             transcript,
             expressionResult,
             facialSummary,
+            facialExpressionScores,
+            scoreFusionGuidance: "combinedExpressionScores should roughly follow audioContentScores * 0.6 + facialExpressionScores * 0.4, with lower confidence if the transcript and face cues conflict.",
             allowedTones: COMMUNICATION_TONES,
             allowedExpressions: EXPRESSIONS,
             requiredWarning: WARNING,
@@ -349,6 +418,51 @@ export async function POST(request: Request) {
                 type: "string",
                 enum: EXPRESSIONS,
               },
+              audioContentExpression: {
+                type: "string",
+                enum: EXPRESSIONS,
+                description:
+                  "Best expression label from transcript/audio-content cues only.",
+              },
+              finalExpression: {
+                type: "string",
+                enum: EXPRESSIONS,
+                description:
+                  "Best final expression label after combining transcript/audio content and facial cues.",
+              },
+              audioContentScores: {
+                type: "object",
+                additionalProperties: false,
+                properties: Object.fromEntries(
+                  EXPRESSIONS.map((expression) => [
+                    expression,
+                    { type: "number", minimum: 0, maximum: 1 },
+                  ]),
+                ),
+                required: EXPRESSIONS,
+              },
+              facialExpressionScores: {
+                type: "object",
+                additionalProperties: false,
+                properties: Object.fromEntries(
+                  EXPRESSIONS.map((expression) => [
+                    expression,
+                    { type: "number", minimum: 0, maximum: 1 },
+                  ]),
+                ),
+                required: EXPRESSIONS,
+              },
+              combinedExpressionScores: {
+                type: "object",
+                additionalProperties: false,
+                properties: Object.fromEntries(
+                  EXPRESSIONS.map((expression) => [
+                    expression,
+                    { type: "number", minimum: 0, maximum: 1 },
+                  ]),
+                ),
+                required: EXPRESSIONS,
+              },
               spokenSignals: {
                 type: "array",
                 items: { type: "string" },
@@ -376,6 +490,11 @@ export async function POST(request: Request) {
               "communicationTone",
               "confidence",
               "visibleExpression",
+              "audioContentExpression",
+              "finalExpression",
+              "audioContentScores",
+              "facialExpressionScores",
+              "combinedExpressionScores",
               "spokenSignals",
               "facialSignals",
               "recommendation",
@@ -404,3 +523,12 @@ export async function POST(request: Request) {
     );
   }
 }
+
+
+
+
+
+
+
+
+

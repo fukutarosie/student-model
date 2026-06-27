@@ -42,6 +42,8 @@ type AnalysisResult = {
   warning: string;
 };
 
+type ExpressionScoreMap = Record<AnalysisResult["expression"], number>;
+
 type CommunicationResult = {
   summary: string;
   communicationTone:
@@ -53,6 +55,11 @@ type CommunicationResult = {
     | "mixed";
   confidence: number;
   visibleExpression: AnalysisResult["expression"];
+  audioContentExpression: AnalysisResult["expression"];
+  finalExpression: AnalysisResult["expression"];
+  audioContentScores: ExpressionScoreMap;
+  facialExpressionScores: ExpressionScoreMap;
+  combinedExpressionScores: ExpressionScoreMap;
   spokenSignals: string[];
   facialSignals: string[];
   recommendation: string;
@@ -99,6 +106,7 @@ declare global {
   interface Window {
     SpeechRecognition?: SpeechRecognitionConstructor;
     webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    webkitAudioContext?: typeof AudioContext;
   }
 }
 
@@ -249,6 +257,8 @@ export default function FaceExpressionAnalyzer() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const shouldListenRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioMonitorFrameRef = useRef<number | null>(null);
   const latestScoresRef = useRef<BlendshapeScores>(createEmptyScores());
   const scoreHistoryRef = useRef<ScoreSample[]>([]);
   const lastUiUpdateRef = useRef(0);
@@ -265,6 +275,15 @@ export default function FaceExpressionAnalyzer() {
   const [transcript, setTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [speechSupported, setSpeechSupported] = useState(true);
+  const [speechLanguage, setSpeechLanguage] = useState("en-US");
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
+  const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>(
+    [],
+  );
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [hasAudioSignal, setHasAudioSignal] = useState(false);
+  const [microphoneStatus, setMicrophoneStatus] = useState("Starting");
+  const [microphoneLabel, setMicrophoneLabel] = useState("Default microphone");
   const [communicationResult, setCommunicationResult] =
     useState<CommunicationResult | null>(null);
   const [isAnalyzingCommunication, setIsAnalyzingCommunication] =
@@ -279,6 +298,142 @@ export default function FaceExpressionAnalyzer() {
     () => Math.max(...signalRows.map((signal) => signal.value)),
     [signalRows],
   );
+
+  const loadAudioInputDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      return;
+    }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    setAudioInputDevices(
+      devices.filter((device) => device.kind === "audioinput"),
+    );
+  }, []);
+
+  const stopAudioMonitor = useCallback(() => {
+    if (audioMonitorFrameRef.current !== null) {
+      cancelAnimationFrame(audioMonitorFrameRef.current);
+      audioMonitorFrameRef.current = null;
+    }
+
+    audioContextRef.current?.close();
+    audioContextRef.current = null;
+    setAudioLevel(0);
+    setHasAudioSignal(false);
+  }, []);
+
+  const startAudioMonitor = useCallback((stream: MediaStream) => {
+    stopAudioMonitor();
+
+    const audioTrack = stream.getAudioTracks()[0];
+
+    if (!audioTrack) {
+      setMicrophoneStatus("No microphone track");
+      return;
+    }
+
+    setMicrophoneStatus(audioTrack.enabled ? "Ready" : "Muted");
+    setMicrophoneLabel(audioTrack.label || "Default microphone");
+
+    try {
+      const AudioContextConstructor =
+        window.AudioContext ?? window.webkitAudioContext;
+      const audioContext = new AudioContextConstructor();
+      const source = audioContext.createMediaStreamSource(
+        new MediaStream([audioTrack]),
+      );
+      const analyser = audioContext.createAnalyser();
+
+      analyser.fftSize = 1024;
+      const data = new Uint8Array(analyser.fftSize);
+      source.connect(analyser);
+      audioContextRef.current = audioContext;
+
+      const monitor = () => {
+        analyser.getByteTimeDomainData(data);
+
+        let sum = 0;
+
+        for (const value of data) {
+          const centered = value - 128;
+          sum += centered * centered;
+        }
+
+        const rms = Math.sqrt(sum / data.length) / 128;
+        const nextLevel = Math.min(1, rms * 12);
+
+        setAudioLevel(nextLevel);
+        setHasAudioSignal(nextLevel > 0.01);
+        audioMonitorFrameRef.current = requestAnimationFrame(monitor);
+      };
+
+      monitor();
+    } catch {
+      setMicrophoneStatus("Audio meter unavailable");
+    }
+  }, [stopAudioMonitor]);
+
+  const applyMediaStream = useCallback(
+    async (stream: MediaStream) => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = stream;
+      startAudioMonitor(stream);
+
+      const video = videoRef.current;
+
+      if (video) {
+        video.srcObject = stream;
+        await video.play();
+      }
+
+      const audioDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId;
+
+      if (audioDeviceId) {
+        setSelectedAudioDeviceId(audioDeviceId);
+      }
+
+      await loadAudioInputDevices();
+    },
+    [loadAudioInputDevices, startAudioMonitor],
+  );
+
+  const getMediaStream = useCallback(async (audioDeviceId?: string) => {
+    return navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user" },
+      audio: audioDeviceId
+        ? {
+            deviceId: { exact: audioDeviceId },
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: true,
+          }
+        : {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: true,
+          },
+    });
+  }, []);
+
+  const resumeAudioDetection = useCallback(async () => {
+    try {
+      if (audioContextRef.current?.state === "suspended") {
+        await audioContextRef.current.resume();
+      }
+
+      const audioTrack = streamRef.current?.getAudioTracks()[0];
+
+      if (audioTrack) {
+        audioTrack.enabled = true;
+        setMicrophoneStatus(isListening ? "Listening" : "Ready");
+        return;
+      }
+
+      setMicrophoneStatus("No microphone track");
+    } catch {
+      setMicrophoneStatus("Audio resume failed");
+    }
+  }, [isListening]);
 
   useEffect(() => {
     let cancelled = false;
@@ -305,23 +460,14 @@ export default function FaceExpressionAnalyzer() {
           return;
         }
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
+        const stream = await getMediaStream();
 
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
 
-        streamRef.current = stream;
-        video.srcObject = stream;
-        await video.play();
+        await applyMediaStream(stream);
 
         const vision = await FilesetResolver.forVisionTasks(WASM_URL);
         const landmarker = await FaceLandmarker.createFromOptions(vision, {
@@ -433,6 +579,7 @@ export default function FaceExpressionAnalyzer() {
       }
       speechRecognitionRef.current?.stop();
       speechRecognitionRef.current = null;
+      stopAudioMonitor();
 
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -441,7 +588,7 @@ export default function FaceExpressionAnalyzer() {
         console.error = originalConsoleError;
       }
     };
-  }, []);
+  }, [applyMediaStream, getMediaStream, stopAudioMonitor]);
 
   useEffect(() => {
     return () => {
@@ -455,6 +602,8 @@ export default function FaceExpressionAnalyzer() {
     if (isListening) {
       return;
     }
+
+    void resumeAudioDetection();
 
     const SpeechRecognition =
       window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -470,7 +619,7 @@ export default function FaceExpressionAnalyzer() {
     const recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = navigator.language || "en-US";
+    recognition.lang = speechLanguage;
     shouldListenRef.current = true;
 
     recognition.onresult = (event) => {
@@ -524,18 +673,71 @@ export default function FaceExpressionAnalyzer() {
       recognition.start();
       setIsListening(true);
       setSpeechSupported(true);
+      setMicrophoneStatus((current) =>
+        current === "Ready" ? "Listening" : current,
+      );
     } catch {
       setError("Speech recognition could not be started.");
       setIsListening(false);
     }
-  }, [isListening]);
+  }, [isListening, resumeAudioDetection, speechLanguage]);
 
   const stopSpeechRecognition = useCallback(() => {
     shouldListenRef.current = false;
     speechRecognitionRef.current?.stop();
     setIsListening(false);
     setInterimTranscript("");
+    setMicrophoneStatus((current) =>
+      current === "Listening" ? "Ready" : current,
+    );
   }, []);
+
+  const switchAudioDevice = useCallback(
+    async (deviceId: string) => {
+      if (!deviceId || deviceId === selectedAudioDeviceId) {
+        return;
+      }
+
+      try {
+        stopSpeechRecognition();
+        setError("");
+        setMicrophoneStatus("Switching microphone");
+        const stream = await getMediaStream(deviceId);
+        await applyMediaStream(stream);
+        await audioContextRef.current?.resume();
+        setMicrophoneStatus("Ready");
+      } catch (switchError) {
+        setError(
+          switchError instanceof Error
+            ? switchError.message
+            : "Unable to switch microphone.",
+        );
+      }
+    },
+    [
+      applyMediaStream,
+      getMediaStream,
+      selectedAudioDeviceId,
+      stopSpeechRecognition,
+    ],
+  );
+
+  const toggleMicrophone = useCallback(() => {
+    const audioTracks = streamRef.current?.getAudioTracks() ?? [];
+    const shouldEnable = audioTracks.some((track) => !track.enabled);
+
+    for (const track of audioTracks) {
+      track.enabled = shouldEnable;
+    }
+
+    setMicrophoneStatus(shouldEnable ? "Ready" : "Muted");
+
+    if (!shouldEnable) {
+      stopSpeechRecognition();
+    } else {
+      void resumeAudioDetection();
+    }
+  }, [resumeAudioDetection, stopSpeechRecognition]);
 
   const startRecording = useCallback(() => {
     const stream = streamRef.current;
@@ -582,10 +784,11 @@ export default function FaceExpressionAnalyzer() {
     mediaRecorderRef.current = recorder;
     setError("");
     setCommunicationResult(null);
+    void resumeAudioDetection();
     recorder.start(1000);
     setIsRecording(true);
     startSpeechRecognition();
-  }, [recordingUrl, startSpeechRecognition]);
+  }, [recordingUrl, resumeAudioDetection, startSpeechRecognition]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current?.state === "recording") {
@@ -690,15 +893,16 @@ export default function FaceExpressionAnalyzer() {
   return (
     <section className="min-h-0 flex-1 md:h-[calc(100vh-112px)]">
       <div className="grid h-full min-h-0 gap-3 md:grid-cols-[minmax(0,1.6fr)_minmax(330px,0.75fr)]">
-        <div className="flex min-h-[420px] flex-col border border-cyan-200/20 bg-[#080b12]/90 p-3 shadow-[0_0_56px_rgba(20,184,166,0.12)] backdrop-blur md:min-h-0">
-          <div className="mb-3 grid shrink-0 grid-cols-2 gap-2 xl:grid-cols-4">
+        <div className="flex min-h-[420px] flex-col overflow-hidden border border-cyan-200/20 bg-[#080b12]/90 p-3 shadow-[0_0_56px_rgba(20,184,166,0.12)] backdrop-blur md:min-h-0">
+          <div className="mb-3 grid shrink-0 grid-cols-2 gap-2 xl:grid-cols-5">
             <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
             <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
             <Metric label="Signal" value={clampPercent(signalStrength)} />
             <Metric
-              label="Window"
-              value={`${sampleCount} samples`}
+              label="Audio"
+              value={hasAudioSignal ? "Signal detected" : microphoneStatus}
             />
+            <Metric label="Window" value={`${sampleCount} samples`} />
           </div>
 
           <div className="relative min-h-[300px] flex-1 overflow-hidden border border-cyan-100/25 bg-black">
@@ -716,54 +920,127 @@ export default function FaceExpressionAnalyzer() {
             </div>
           </div>
 
-          <div className="mt-3 grid shrink-0 gap-2 sm:grid-cols-3">
-            <button
-              type="button"
-              onClick={isRecording ? stopRecording : startRecording}
-              disabled={!isReady}
-              className="h-11 border border-cyan-100/40 bg-cyan-100 px-4 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
-            >
-              {isRecording ? "Stop Recording" : "Record Session"}
-            </button>
-            <button
-              type="button"
-              onClick={isListening ? stopSpeechRecognition : startSpeechRecognition}
-              disabled={!speechSupported}
-              className="h-11 border border-white/15 bg-white/[0.04] px-4 text-sm font-semibold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:text-slate-500"
-            >
-              {isListening ? "Stop Voice" : "Listen Voice"}
-            </button>
-            <button
-              type="button"
-              onClick={clearSession}
-              className="h-11 border border-white/15 bg-black/30 px-4 text-sm font-semibold text-slate-200 transition hover:bg-white/10"
-            >
-              Clear Session
-            </button>
-          </div>
-
-          {recordingUrl ? (
-            <div className="mt-3 border border-emerald-200/25 bg-emerald-950/20 p-3">
-              <div className="flex items-center justify-between gap-3 text-xs uppercase tracking-[0.22em] text-emerald-100/70">
-                <span>Recorded Session</span>
-                <a
-                  href={recordingUrl}
-                  download={`communication-session.${recordingMimeType.includes("mp4") ? "mp4" : "webm"}`}
-                  className="text-emerald-100 underline-offset-4 hover:underline"
-                >
-                  Download
-                </a>
-              </div>
-              <video
-                className="mt-2 max-h-40 w-full bg-black"
-                src={recordingUrl}
-                controls
-              />
+          <div className="mt-3 min-h-0 shrink-0 overflow-y-auto pr-1 md:max-h-[260px]">
+            <div className="grid gap-2 sm:grid-cols-3">
+              <button
+                type="button"
+                onClick={isRecording ? stopRecording : startRecording}
+                disabled={!isReady}
+                className="h-11 border border-cyan-100/40 bg-cyan-100 px-4 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
+              >
+                {isRecording ? "Stop Recording" : "Record Session"}
+              </button>
+              <button
+                type="button"
+                onClick={isListening ? stopSpeechRecognition : startSpeechRecognition}
+                disabled={!speechSupported}
+                className="h-11 border border-white/15 bg-white/[0.04] px-4 text-sm font-semibold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:text-slate-500"
+              >
+                {isListening ? "Stop Voice" : "Listen Voice"}
+              </button>
+              <button
+                type="button"
+                onClick={clearSession}
+                className="h-11 border border-white/15 bg-black/30 px-4 text-sm font-semibold text-slate-200 transition hover:bg-white/10"
+              >
+                Clear Session
+              </button>
             </div>
-          ) : null}
+
+            <div className="mt-3 border border-sky-200/20 bg-sky-950/15 p-3">
+              <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+                <div>
+                  <div className="flex items-center justify-between gap-3 text-xs uppercase tracking-[0.22em] text-sky-100/70">
+                    <span>Audio Detection</span>
+                    <span>{Math.round(audioLevel * 100)}%</span>
+                  </div>
+                  <div className="mt-2 h-2 bg-white/10">
+                    <div
+                      className={`h-full ${
+                        hasAudioSignal ? "bg-emerald-300" : "bg-sky-200"
+                      }`}
+                      style={{ width: clampPercent(audioLevel) }}
+                    />
+                  </div>
+                  <p className="mt-2 truncate text-xs text-slate-400">
+                    {microphoneLabel} / {microphoneStatus}
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
+                  <select
+                    value={selectedAudioDeviceId}
+                    onChange={(event) => void switchAudioDevice(event.target.value)}
+                    className="h-10 min-w-0 border border-white/15 bg-black/40 px-2 text-xs text-slate-100 xl:col-span-2"
+                    aria-label="Microphone input device"
+                  >
+                    {audioInputDevices.length === 0 ? (
+                      <option value="">Default microphone</option>
+                    ) : null}
+                    {audioInputDevices.map((device, index) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {device.label || `Microphone ${index + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={speechLanguage}
+                    onChange={(event) => setSpeechLanguage(event.target.value)}
+                    className="h-10 border border-white/15 bg-black/40 px-2 text-xs text-slate-100"
+                    aria-label="Speech recognition language"
+                  >
+                    <option value="en-US">English US</option>
+                    <option value="en-GB">English UK</option>
+                    <option value="id-ID">Indonesian</option>
+                    <option value="zh-CN">Chinese</option>
+                    <option value="ja-JP">Japanese</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={toggleMicrophone}
+                    className="h-10 border border-white/15 bg-white/[0.04] px-3 text-xs font-semibold text-slate-100 transition hover:bg-white/10"
+                  >
+                    {microphoneStatus === "Muted" ? "Enable Mic" : "Mute Mic"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void resumeAudioDetection()}
+                    className="h-10 border border-sky-100/25 bg-sky-100/10 px-3 text-xs font-semibold text-sky-100 transition hover:bg-sky-100/20"
+                  >
+                    Test Mic
+                  </button>
+                </div>
+              </div>
+              {!hasAudioSignal && microphoneStatus !== "Muted" ? (
+                <p className="mt-2 text-xs leading-5 text-sky-100/65">
+                  Speak near the microphone. If the meter stays at 0%, check browser
+                  microphone permission and Windows input device settings.
+                </p>
+              ) : null}
+            </div>
+
+            {recordingUrl ? (
+              <div className="mt-3 border border-emerald-200/25 bg-emerald-950/20 p-3">
+                <div className="flex items-center justify-between gap-3 text-xs uppercase tracking-[0.22em] text-emerald-100/70">
+                  <span>Recorded Session</span>
+                  <a
+                    href={recordingUrl}
+                    download={`communication-session.${recordingMimeType.includes("mp4") ? "mp4" : "webm"}`}
+                    className="text-emerald-100 underline-offset-4 hover:underline"
+                  >
+                    Download
+                  </a>
+                </div>
+                <video
+                  className="mt-2 max-h-40 w-full bg-black"
+                  src={recordingUrl}
+                  controls
+                />
+              </div>
+            ) : null}
+          </div>
         </div>
 
-        <div className="grid min-h-0 gap-3 md:grid-rows-[auto_1fr_auto]">
+        <div className="grid min-h-0 gap-3 overflow-y-auto pr-1 md:grid-rows-[auto_minmax(300px,1.15fr)_minmax(210px,0.75fr)]">
           <div className="border border-violet-200/20 bg-[#11101a]/90 p-4 shadow-[0_0_56px_rgba(139,92,246,0.12)] backdrop-blur">
             <p className="text-[11px] uppercase tracking-[0.32em] text-violet-200/70">
               AI Interpretation
@@ -820,24 +1097,23 @@ export default function FaceExpressionAnalyzer() {
             </div>
           </div>
 
-          <div className="min-h-0 overflow-y-auto border border-amber-200/20 bg-[#15110b]/90 p-4 backdrop-blur">
+          <div className="flex min-h-[300px] flex-col overflow-y-auto border border-amber-200/20 bg-[#15110b]/90 p-4 backdrop-blur">
             <p className="text-[11px] uppercase tracking-[0.32em] text-amber-200/70">
               Voice Transcript
             </p>
-            <div className="mt-3 min-h-28 border border-white/10 bg-black/25 p-3 text-sm leading-6 text-amber-50/90">
-              {transcript || interimTranscript ? (
-                <>
-                  {transcript}
-                  {interimTranscript ? (
-                    <span className="text-amber-100/55"> {interimTranscript}</span>
-                  ) : null}
-                </>
-              ) : (
-                <span className="text-slate-500">
-                  Start recording or voice listening to capture participant words.
-                </span>
-              )}
-            </div>
+            <textarea
+              value={
+                interimTranscript
+                  ? `${transcript}${transcript ? " " : ""}${interimTranscript}`
+                  : transcript
+              }
+              onChange={(event) => {
+                setTranscript(event.target.value);
+                setInterimTranscript("");
+              }}
+              placeholder="Start recording/listening, or type participant words here if browser speech recognition is not working."
+              className="mt-3 min-h-56 flex-1 resize-none border border-white/10 bg-black/25 p-3 text-base leading-7 text-amber-50/90 outline-none placeholder:text-slate-500 focus:border-amber-100/35"
+            />
 
             {communicationResult ? (
               <div className="mt-3 border border-violet-200/25 bg-violet-950/20 p-3">
@@ -847,6 +1123,54 @@ export default function FaceExpressionAnalyzer() {
                 <p className="mt-1 text-2xl font-semibold capitalize">
                   {communicationResult.communicationTone}
                 </p>
+                <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3">
+                  <div className="border border-white/10 bg-black/20 p-2">
+                    <span className="block uppercase tracking-[0.18em] text-slate-500">
+                      Audio Content
+                    </span>
+                    <span className="mt-1 block font-semibold text-amber-100">
+                      {EXPRESSION_LABELS[communicationResult.audioContentExpression]}
+                    </span>
+                  </div>
+                  <div className="border border-white/10 bg-black/20 p-2">
+                    <span className="block uppercase tracking-[0.18em] text-slate-500">
+                      Face Cues
+                    </span>
+                    <span className="mt-1 block font-semibold text-cyan-100">
+                      {EXPRESSION_LABELS[communicationResult.visibleExpression]}
+                    </span>
+                  </div>
+                  <div className="border border-white/10 bg-black/20 p-2">
+                    <span className="block uppercase tracking-[0.18em] text-slate-500">
+                      Final Expression
+                    </span>
+                    <span className="mt-1 block font-semibold text-violet-100">
+                      {EXPRESSION_LABELS[communicationResult.finalExpression]}
+                    </span>
+                  </div>
+                </div>
+                <div className="mt-3 grid gap-1.5 text-xs">
+                  {Object.entries(communicationResult.combinedExpressionScores).map(
+                    ([expression, score]) => (
+                      <div key={expression}>
+                        <div className="mb-1 flex items-center justify-between gap-3">
+                          <span className="text-slate-300">
+                            {EXPRESSION_LABELS[expression as AnalysisResult["expression"]]}
+                          </span>
+                          <span className="font-mono text-violet-100">
+                            {Math.round(score * 100)}%
+                          </span>
+                        </div>
+                        <div className="h-1.5 bg-white/10">
+                          <div
+                            className="h-full bg-violet-200"
+                            style={{ width: clampPercent(score) }}
+                          />
+                        </div>
+                      </div>
+                    ),
+                  )}
+                </div>
                 <p className="mt-2 text-sm leading-6 text-slate-200">
                   {communicationResult.summary}
                 </p>
@@ -917,3 +1241,5 @@ function Metric({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
+
+
