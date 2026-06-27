@@ -4,8 +4,9 @@ import {
   FaceLandmarker,
   FilesetResolver,
   type Category,
+  type FaceLandmarkerResult,
 } from "@mediapipe/tasks-vision";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const BLENDSHAPE_KEYS = [
   "mouthSmileLeft",
@@ -22,6 +23,10 @@ const BLENDSHAPE_KEYS = [
 
 type BlendshapeKey = (typeof BLENDSHAPE_KEYS)[number];
 type BlendshapeScores = Record<BlendshapeKey, number>;
+type ScoreSample = {
+  timestamp: number;
+  scores: BlendshapeScores;
+};
 
 type AnalysisResult = {
   expression:
@@ -37,10 +42,50 @@ type AnalysisResult = {
   warning: string;
 };
 
+type SignalRow = {
+  label: string;
+  detail: string;
+  value: number;
+};
+
+const EXPRESSION_LABELS: Record<AnalysisResult["expression"], string> = {
+  happy: "Happy",
+  neutral: "Neutral",
+  sad: "Sad",
+  angry: "Angry / Tense",
+  surprised: "Surprised",
+  tired: "Tired",
+  unclear: "Unclear",
+};
+
+const BLENDSHAPE_LABELS: Record<BlendshapeKey, string> = {
+  mouthSmileLeft: "Left smile",
+  mouthSmileRight: "Right smile",
+  browDownLeft: "Left brow down",
+  browDownRight: "Right brow down",
+  eyeSquintLeft: "Left eye squint",
+  eyeSquintRight: "Right eye squint",
+  jawOpen: "Jaw open",
+  browInnerUp: "Inner brow up",
+  mouthFrownLeft: "Left frown",
+  mouthFrownRight: "Right frown",
+};
+
 const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task";
+const SAMPLE_WINDOW_MS = 4000;
+const SAMPLE_INTERVAL_MS = 120;
+const MAX_SCORE_SAMPLES = 48;
+
+function isMediaPipeInfoLog(args: unknown[]) {
+  return args.some(
+    (arg) =>
+      typeof arg === "string" &&
+      arg.includes("Created TensorFlow Lite XNNPACK delegate for CPU"),
+  );
+}
 
 function createEmptyScores(): BlendshapeScores {
   return Object.fromEntries(
@@ -60,13 +105,94 @@ function extractScores(categories: Category[]): BlendshapeScores {
   return scores;
 }
 
+function average(left: number, right: number) {
+  return (left + right) / 2;
+}
+
+function clampPercent(value: number) {
+  return `${Math.max(0, Math.min(100, Math.round(value * 100)))}%`;
+}
+
+function getAngryTensionIndex(scores: BlendshapeScores) {
+  const smileAverage = average(scores.mouthSmileLeft, scores.mouthSmileRight);
+  const frownAverage = average(scores.mouthFrownLeft, scores.mouthFrownRight);
+  const browTension = average(scores.browDownLeft, scores.browDownRight);
+  const eyeNarrowing = average(scores.eyeSquintLeft, scores.eyeSquintRight);
+  const lowSmile = 1 - Math.max(0, Math.min(1, smileAverage));
+  const synergy =
+    browTension > 0.24 && eyeNarrowing > 0.18 && smileAverage < 0.24
+      ? 0.22
+      : 0;
+
+  return Math.max(
+    0,
+    Math.min(
+      1,
+      browTension * 0.42 +
+        eyeNarrowing * 0.28 +
+        frownAverage * 0.18 +
+        lowSmile * 0.1 +
+        synergy,
+    ),
+  );
+}
+
+function getSignalRows(scores: BlendshapeScores): SignalRow[] {
+  return [
+    {
+      label: "Angry / Tense",
+      detail: "brow + eyes + frown",
+      value: getAngryTensionIndex(scores),
+    },
+    {
+      label: "Smile",
+      detail: "mouth corners",
+      value: average(scores.mouthSmileLeft, scores.mouthSmileRight),
+    },
+    {
+      label: "Brow",
+      detail: "downward pressure",
+      value: average(scores.browDownLeft, scores.browDownRight),
+    },
+    {
+      label: "Eyes",
+      detail: "squint signal",
+      value: average(scores.eyeSquintLeft, scores.eyeSquintRight),
+    },
+    {
+      label: "Jaw",
+      detail: "opening",
+      value: scores.jawOpen,
+    },
+    {
+      label: "Inner Brow",
+      detail: "lift",
+      value: scores.browInnerUp,
+    },
+    {
+      label: "Frown",
+      detail: "mouth downturn",
+      value: average(scores.mouthFrownLeft, scores.mouthFrownRight),
+    },
+  ];
+}
+
+function getTopBlendshapes(scores: BlendshapeScores) {
+  return [...BLENDSHAPE_KEYS]
+    .map((key) => ({ key, score: scores[key] }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+}
+
 export default function FaceExpressionAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const latestScoresRef = useRef<BlendshapeScores>(createEmptyScores());
+  const scoreHistoryRef = useRef<ScoreSample[]>([]);
   const lastUiUpdateRef = useRef(0);
+  const lastSampleAtRef = useRef(0);
 
   const [scores, setScores] = useState<BlendshapeScores>(createEmptyScores);
   const [hasFace, setHasFace] = useState(false);
@@ -74,9 +200,27 @@ export default function FaceExpressionAnalyzer() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [sampleCount, setSampleCount] = useState(0);
+
+  const signalRows = useMemo(() => getSignalRows(scores), [scores]);
+  const topBlendshapes = useMemo(() => getTopBlendshapes(scores), [scores]);
+  const signalStrength = useMemo(
+    () => Math.max(...signalRows.map((signal) => signal.value)),
+    [signalRows],
+  );
 
   useEffect(() => {
     let cancelled = false;
+    const originalConsoleError = console.error;
+    const patchedConsoleError = (...args: unknown[]) => {
+      if (isMediaPipeInfoLog(args)) {
+        return;
+      }
+
+      originalConsoleError(...args);
+    };
+
+    console.error = patchedConsoleError;
 
     async function startCameraAndDetector() {
       try {
@@ -135,26 +279,49 @@ export default function FaceExpressionAnalyzer() {
             currentLandmarker &&
             currentVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
           ) {
-            const detection = currentLandmarker.detectForVideo(
-              currentVideo,
-              performance.now(),
-            );
+            let detection: FaceLandmarkerResult;
+
+            try {
+              detection = currentLandmarker.detectForVideo(
+                currentVideo,
+                performance.now(),
+              );
+            } catch (detectionError) {
+              setError(
+                detectionError instanceof Error
+                  ? detectionError.message
+                  : "Face detection failed.",
+              );
+              animationFrameRef.current = requestAnimationFrame(detect);
+              return;
+            }
+
             const categories = detection.faceBlendshapes[0]?.categories ?? [];
             const detected =
               detection.faceLandmarks.length > 0 && categories.length > 0;
             const nextScores = detected
               ? extractScores(categories)
               : createEmptyScores();
+            const now = performance.now();
 
             if (detected) {
               latestScoresRef.current = nextScores;
-            }
 
-            const now = performance.now();
+              if (now - lastSampleAtRef.current >= SAMPLE_INTERVAL_MS) {
+                scoreHistoryRef.current = [
+                  ...scoreHistoryRef.current,
+                  { timestamp: now, scores: nextScores },
+                ]
+                  .filter((sample) => now - sample.timestamp <= SAMPLE_WINDOW_MS)
+                  .slice(-MAX_SCORE_SAMPLES);
+                lastSampleAtRef.current = now;
+              }
+            }
 
             if (now - lastUiUpdateRef.current > 150) {
               setHasFace(detected);
               setScores(nextScores);
+              setSampleCount(detected ? scoreHistoryRef.current.length : 0);
               lastUiUpdateRef.current = now;
             }
           }
@@ -188,6 +355,10 @@ export default function FaceExpressionAnalyzer() {
 
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+
+      if (console.error === patchedConsoleError) {
+        console.error = originalConsoleError;
+      }
     };
   }, []);
 
@@ -206,7 +377,10 @@ export default function FaceExpressionAnalyzer() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ scores: latestScoresRef.current }),
+        body: JSON.stringify({
+          scores: latestScoresRef.current,
+          samples: scoreHistoryRef.current,
+        }),
       });
       const data = await response.json();
 
@@ -227,86 +401,117 @@ export default function FaceExpressionAnalyzer() {
   }, [hasFace]);
 
   return (
-    <section className="w-full max-w-5xl rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-        <div className="space-y-4">
-          <div className="overflow-hidden rounded-md bg-zinc-950">
+    <section className="min-h-0 flex-1 md:h-[calc(100vh-112px)]">
+      <div className="grid h-full min-h-0 gap-3 md:grid-cols-[minmax(0,1.6fr)_minmax(330px,0.75fr)]">
+        <div className="flex min-h-[420px] flex-col border border-cyan-200/20 bg-[#080b12]/90 p-3 shadow-[0_0_56px_rgba(20,184,166,0.12)] backdrop-blur md:min-h-0">
+          <div className="mb-3 grid shrink-0 grid-cols-2 gap-2 xl:grid-cols-4">
+            <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
+            <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
+            <Metric label="Signal" value={clampPercent(signalStrength)} />
+            <Metric label="Window" value={`${sampleCount} samples`} />
+          </div>
+
+          <div className="relative min-h-[300px] flex-1 overflow-hidden border border-cyan-100/25 bg-black">
             <video
               ref={videoRef}
-              className="aspect-video w-full object-cover"
+              className="h-full min-h-[300px] w-full object-cover opacity-90"
               muted
               playsInline
               autoPlay
             />
+            <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(34,211,238,0.08)_1px,transparent_1px),linear-gradient(0deg,rgba(34,211,238,0.07)_1px,transparent_1px)] bg-[size:42px_42px]" />
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-b from-cyan-300/12 to-transparent" />
+            <div className="pointer-events-none absolute bottom-3 left-3 border border-cyan-200/25 bg-black/55 px-3 py-2 text-[11px] uppercase tracking-[0.26em] text-cyan-100/75 backdrop-blur">
+              Live Blendshape Reading
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <span
-              className={`rounded-full px-3 py-1 text-sm font-medium ${
-                hasFace
-                  ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200"
-                  : "bg-zinc-100 text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
-              }`}
-            >
-              {hasFace ? "Face detected" : "No face detected"}
-            </span>
-            <span className="text-sm text-zinc-500">
-              {isReady ? "Detector ready" : "Starting camera and model..."}
-            </span>
-          </div>
-          <p className="text-sm leading-6 text-zinc-600 dark:text-zinc-400">
-            Only MediaPipe facial blendshape scores are sent for analysis. No
-            video, screenshots, identity data, or audio are uploaded.
-          </p>
         </div>
 
-        <div className="space-y-4">
-          <button
-            type="button"
-            onClick={analyzeExpression}
-            disabled={!hasFace || isAnalyzing}
-            className="w-full rounded-md bg-zinc-950 px-4 py-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-600 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-300 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-500"
-          >
-            {isAnalyzing ? "Analyzing..." : "Analyze Expression"}
-          </button>
+        <div className="grid min-h-0 gap-3 md:grid-rows-[auto_1fr_auto]">
+          <div className="border border-violet-200/20 bg-[#11101a]/90 p-4 shadow-[0_0_56px_rgba(139,92,246,0.12)] backdrop-blur">
+            <p className="text-[11px] uppercase tracking-[0.32em] text-violet-200/70">
+              AI Interpretation
+            </p>
+            <h2 className="mt-2 text-xl font-semibold tracking-tight">
+              Visible Expression
+            </h2>
 
-          {error ? (
-            <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
-              {error}
-            </div>
-          ) : null}
+            <button
+              type="button"
+              onClick={analyzeExpression}
+              disabled={!hasFace || isAnalyzing}
+              className="mt-3 h-12 w-full border border-cyan-100/40 bg-cyan-100 px-5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
+            >
+              {isAnalyzing ? "Interpreting..." : "Analyze"}
+            </button>
 
-          {result ? (
-            <div className="rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
-              <h2 className="text-base font-semibold">Visible expression</h2>
-              <dl className="mt-3 space-y-2 text-sm">
-                <div className="flex justify-between gap-4">
-                  <dt className="text-zinc-500">Expression</dt>
-                  <dd className="font-medium">{result.expression}</dd>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <dt className="text-zinc-500">Confidence</dt>
-                  <dd className="font-medium">
-                    {Math.round(result.confidence * 100)}%
-                  </dd>
-                </div>
-              </dl>
-              <p className="mt-3 text-sm leading-6 text-zinc-700 dark:text-zinc-300">
-                {result.reason}
+            {error ? (
+              <div className="mt-3 border border-red-300/35 bg-red-950/40 p-3 text-sm leading-5 text-red-100">
+                {error}
+              </div>
+            ) : null}
+
+            <div className="mt-3 border border-cyan-100/25 bg-cyan-950/20 p-4">
+              <p className="text-[11px] uppercase tracking-[0.26em] text-cyan-100/65">
+                Reading
               </p>
-              <p className="mt-3 text-xs leading-5 text-zinc-500">
-                {result.warning}
+              <p className="mt-2 text-3xl font-semibold">
+                {result ? EXPRESSION_LABELS[result.expression] : "Standby"}
+              </p>
+              <div className="mt-3 h-2 bg-white/10">
+                <div
+                  className="h-full bg-cyan-200"
+                  style={{ width: result ? clampPercent(result.confidence) : "0%" }}
+                />
+              </div>
+              <p className="mt-2 text-xs uppercase tracking-[0.2em] text-cyan-100/70">
+                Confidence {result ? Math.round(result.confidence * 100) : 0}%
               </p>
             </div>
-          ) : null}
+          </div>
 
-          <div className="rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
-            <h2 className="text-base font-semibold">Debug scores</h2>
-            <dl className="mt-3 grid gap-2 text-sm">
-              {BLENDSHAPE_KEYS.map((key) => (
-                <div key={key} className="grid grid-cols-[1fr_auto] gap-3">
-                  <dt className="truncate text-zinc-500">{key}</dt>
-                  <dd className="font-mono text-zinc-900 dark:text-zinc-100">
-                    {scores[key].toFixed(3)}
+          <div className="min-h-0 border border-amber-200/20 bg-[#15110b]/90 p-4 backdrop-blur">
+            <p className="text-[11px] uppercase tracking-[0.32em] text-amber-200/70">
+              Signal Matrix
+            </p>
+            <div className="mt-3 grid gap-3">
+              {signalRows.map((signal) => (
+                <div key={signal.label}>
+                  <div className="mb-1.5 flex items-center justify-between gap-4 text-xs">
+                    <span className="font-medium text-amber-50">
+                      {signal.label}
+                    </span>
+                    <span className="text-slate-400">{signal.detail}</span>
+                  </div>
+                  <div className="h-1.5 bg-white/10">
+                    <div
+                      className="h-full bg-amber-200"
+                      style={{ width: clampPercent(signal.value) }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="border border-white/10 bg-black/35 p-4 backdrop-blur">
+            <p className="text-[11px] uppercase tracking-[0.32em] text-slate-400">
+              Peak Raw Scores
+            </p>
+            <dl className="mt-3 grid gap-2 text-xs">
+              {topBlendshapes.map(({ key, score }) => (
+                <div
+                  key={key}
+                  className="grid grid-cols-[1fr_auto] gap-4 border-b border-white/10 pb-2 last:border-b-0 last:pb-0"
+                >
+                  <dt>
+                    <span className="block font-medium text-slate-100">
+                      {BLENDSHAPE_LABELS[key]}
+                    </span>
+                    <span className="text-slate-500">{key}</span>
+                  </dt>
+                  <dd className="font-mono text-cyan-100">
+                    {score.toFixed(3)}
                   </dd>
                 </div>
               ))}
@@ -315,5 +520,16 @@ export default function FaceExpressionAnalyzer() {
         </div>
       </div>
     </section>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="border border-white/10 bg-white/[0.03] p-2.5">
+      <p className="text-[10px] uppercase tracking-[0.24em] text-cyan-200/70">
+        {label}
+      </p>
+      <p className="mt-1 truncate text-sm font-semibold text-white">{value}</p>
+    </div>
   );
 }

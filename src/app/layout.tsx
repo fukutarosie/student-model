@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "摄像头人脸表情倾向分析",
+  title: "Expression Signal Console",
   description: "Analyze visible facial expression scores locally with MediaPipe.",
 };
 
