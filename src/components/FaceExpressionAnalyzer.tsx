@@ -251,6 +251,7 @@ function getTopBlendshapes(scores: BlendshapeScores) {
 export default function FaceExpressionAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -272,6 +273,7 @@ export default function FaceExpressionAnalyzer() {
   const [isListening, setIsListening] = useState(false);
   const [recordingUrl, setRecordingUrl] = useState("");
   const [recordingMimeType, setRecordingMimeType] = useState("");
+  const [recordingAudioStatus, setRecordingAudioStatus] = useState("Not recording");
   const [transcript, setTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [speechSupported, setSpeechSupported] = useState(true);
@@ -377,7 +379,6 @@ export default function FaceExpressionAnalyzer() {
     async (stream: MediaStream) => {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = stream;
-      startAudioMonitor(stream);
 
       const video = videoRef.current;
 
@@ -385,21 +386,21 @@ export default function FaceExpressionAnalyzer() {
         video.srcObject = stream;
         await video.play();
       }
-
-      const audioDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId;
-
-      if (audioDeviceId) {
-        setSelectedAudioDeviceId(audioDeviceId);
-      }
-
       await loadAudioInputDevices();
     },
-    [loadAudioInputDevices, startAudioMonitor],
+    [loadAudioInputDevices],
   );
 
-  const getMediaStream = useCallback(async (audioDeviceId?: string) => {
+  const getMediaStream = useCallback(async () => {
     return navigator.mediaDevices.getUserMedia({
       video: { facingMode: "user" },
+      audio: false,
+    });
+  }, []);
+
+  const getAudioStream = useCallback(async (audioDeviceId?: string) => {
+    return navigator.mediaDevices.getUserMedia({
+      video: false,
       audio: audioDeviceId
         ? {
             deviceId: { exact: audioDeviceId },
@@ -415,13 +416,48 @@ export default function FaceExpressionAnalyzer() {
     });
   }, []);
 
+  const applyAudioStream = useCallback(
+    async (stream: MediaStream) => {
+      audioStreamRef.current?.getTracks().forEach((track) => track.stop());
+      audioStreamRef.current = stream;
+      startAudioMonitor(stream);
+
+      const audioTrack = stream.getAudioTracks()[0];
+      const audioDeviceId = audioTrack?.getSettings().deviceId;
+
+      if (audioDeviceId) {
+        setSelectedAudioDeviceId(audioDeviceId);
+      }
+
+      if (audioTrack) {
+        audioTrack.enabled = true;
+        setRecordingAudioStatus("Audio stream ready");
+      }
+
+      await loadAudioInputDevices();
+    },
+    [loadAudioInputDevices, startAudioMonitor],
+  );
+
+  const refreshAudioStream = useCallback(
+    async (audioDeviceId?: string) => {
+      const stream = await getAudioStream(audioDeviceId || selectedAudioDeviceId);
+      await applyAudioStream(stream);
+      await audioContextRef.current?.resume();
+      return stream;
+    },
+    [applyAudioStream, getAudioStream, selectedAudioDeviceId],
+  );
+
   const resumeAudioDetection = useCallback(async () => {
     try {
       if (audioContextRef.current?.state === "suspended") {
         await audioContextRef.current.resume();
       }
 
-      const audioTrack = streamRef.current?.getAudioTracks()[0];
+      const audioTrack =
+        audioStreamRef.current?.getAudioTracks()[0] ??
+        streamRef.current?.getAudioTracks()[0];
 
       if (audioTrack) {
         audioTrack.enabled = true;
@@ -468,6 +504,14 @@ export default function FaceExpressionAnalyzer() {
         }
 
         await applyMediaStream(stream);
+        const audioStream = await getAudioStream();
+
+        if (cancelled) {
+          audioStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        await applyAudioStream(audioStream);
 
         const vision = await FilesetResolver.forVisionTasks(WASM_URL);
         const landmarker = await FaceLandmarker.createFromOptions(vision, {
@@ -583,12 +627,20 @@ export default function FaceExpressionAnalyzer() {
 
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+      audioStreamRef.current?.getTracks().forEach((track) => track.stop());
+      audioStreamRef.current = null;
 
       if (console.error === patchedConsoleError) {
         console.error = originalConsoleError;
       }
     };
-  }, [applyMediaStream, getMediaStream, stopAudioMonitor]);
+  }, [
+    applyAudioStream,
+    applyMediaStream,
+    getAudioStream,
+    getMediaStream,
+    stopAudioMonitor,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -702,9 +754,7 @@ export default function FaceExpressionAnalyzer() {
         stopSpeechRecognition();
         setError("");
         setMicrophoneStatus("Switching microphone");
-        const stream = await getMediaStream(deviceId);
-        await applyMediaStream(stream);
-        await audioContextRef.current?.resume();
+        await refreshAudioStream(deviceId);
         setMicrophoneStatus("Ready");
       } catch (switchError) {
         setError(
@@ -715,15 +765,14 @@ export default function FaceExpressionAnalyzer() {
       }
     },
     [
-      applyMediaStream,
-      getMediaStream,
+      refreshAudioStream,
       selectedAudioDeviceId,
       stopSpeechRecognition,
     ],
   );
 
   const toggleMicrophone = useCallback(() => {
-    const audioTracks = streamRef.current?.getAudioTracks() ?? [];
+    const audioTracks = audioStreamRef.current?.getAudioTracks() ?? [];
     const shouldEnable = audioTracks.some((track) => !track.enabled);
 
     for (const track of audioTracks) {
@@ -739,8 +788,10 @@ export default function FaceExpressionAnalyzer() {
     }
   }, [resumeAudioDetection, stopSpeechRecognition]);
 
-  const startRecording = useCallback(() => {
-    const stream = streamRef.current;
+  const startRecording = useCallback(async () => {
+    await resumeAudioDetection();
+
+    let stream = streamRef.current;
 
     if (!stream) {
       setError("Camera and microphone are not ready yet.");
@@ -757,6 +808,55 @@ export default function FaceExpressionAnalyzer() {
       setRecordingUrl("");
     }
 
+    let videoTracks = stream
+      .getVideoTracks()
+      .filter((track) => track.readyState === "live");
+    let audioStream = audioStreamRef.current;
+    let audioTracks = (audioStream?.getAudioTracks() ?? [])
+      .filter((track) => track.readyState === "live");
+
+    if (videoTracks.length === 0 || audioTracks.length === 0) {
+      try {
+        if (videoTracks.length === 0) {
+          const refreshedStream = await getMediaStream();
+          await applyMediaStream(refreshedStream);
+          stream = refreshedStream;
+          videoTracks = stream
+            .getVideoTracks()
+            .filter((track) => track.readyState === "live");
+        }
+
+        if (audioTracks.length === 0) {
+          audioStream = await refreshAudioStream(selectedAudioDeviceId);
+          audioTracks = audioStream
+            .getAudioTracks()
+            .filter((track) => track.readyState === "live");
+        }
+      } catch {
+        setError("Unable to refresh camera and microphone before recording.");
+        return;
+      }
+    }
+
+    if (videoTracks.length === 0) {
+      setError("Recording cannot start because no live camera track was found.");
+      return;
+    }
+
+    if (audioTracks.length === 0) {
+      setError("Recording cannot start because no live microphone track was found.");
+      setRecordingAudioStatus("No audio track");
+      return;
+    }
+
+    for (const audioTrack of audioTracks) {
+      audioTrack.enabled = true;
+    }
+
+    const recordingStream = new MediaStream([
+      ...videoTracks,
+      ...audioTracks,
+    ]);
     const preferredTypes = [
       "video/webm;codecs=vp9,opus",
       "video/webm;codecs=vp8,opus",
@@ -764,7 +864,10 @@ export default function FaceExpressionAnalyzer() {
     ];
     const mimeType =
       preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    const recorder = new MediaRecorder(
+      recordingStream,
+      mimeType ? { mimeType } : undefined,
+    );
 
     recordedChunksRef.current = [];
     recorder.ondataavailable = (event) => {
@@ -779,16 +882,34 @@ export default function FaceExpressionAnalyzer() {
       setRecordingMimeType(blob.type);
       setRecordingUrl(URL.createObjectURL(blob));
       setIsRecording(false);
+      setRecordingAudioStatus(
+        audioTracks.length > 0 ? "Audio track recorded" : "No audio track",
+      );
+    };
+    recorder.onerror = () => {
+      setError("Recording failed while capturing camera or microphone.");
+      setIsRecording(false);
+      setRecordingAudioStatus("Recording failed");
     };
 
     mediaRecorderRef.current = recorder;
     setError("");
     setCommunicationResult(null);
-    void resumeAudioDetection();
+    setRecordingAudioStatus(
+      `Recording ${audioTracks.length} audio track${audioTracks.length === 1 ? "" : "s"}`,
+    );
     recorder.start(1000);
     setIsRecording(true);
     startSpeechRecognition();
-  }, [recordingUrl, resumeAudioDetection, startSpeechRecognition]);
+  }, [
+    applyMediaStream,
+    getMediaStream,
+    recordingUrl,
+    refreshAudioStream,
+    resumeAudioDetection,
+    selectedAudioDeviceId,
+    startSpeechRecognition,
+  ]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current?.state === "recording") {
@@ -885,6 +1006,7 @@ export default function FaceExpressionAnalyzer() {
 
     setRecordingUrl("");
     setRecordingMimeType("");
+    setRecordingAudioStatus("Not recording");
     setTranscript("");
     setInterimTranscript("");
     setCommunicationResult(null);
@@ -964,6 +1086,9 @@ export default function FaceExpressionAnalyzer() {
                   </div>
                   <p className="mt-2 truncate text-xs text-slate-400">
                     {microphoneLabel} / {microphoneStatus}
+                  </p>
+                  <p className="mt-1 truncate text-xs text-sky-100/70">
+                    Recorder: {recordingAudioStatus}
                   </p>
                 </div>
                 <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
