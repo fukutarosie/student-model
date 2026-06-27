@@ -1,1 +1,2 @@
 # student-model
+konichiwa
