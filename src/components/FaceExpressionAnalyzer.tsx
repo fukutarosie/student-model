@@ -813,43 +813,43 @@ export default function FaceExpressionAnalyzer() {
   }, [hasFace]);
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col gap-3 md:h-full">
-      <header className="grid shrink-0 gap-3 border-b border-cyan-100/15 pb-3 lg:grid-cols-[minmax(260px,auto)_minmax(0,1fr)] lg:items-end">
-        <div className="min-w-0">
-          <p className="truncate text-[11px] uppercase tracking-[0.4em] text-cyan-200/70">
-            Local Vision / Expanded Signal AI
-          </p>
-          <h1 className="mt-1.5 truncate text-3xl font-semibold tracking-tight text-white md:text-4xl">
-            Expression Signal Console
-          </h1>
-        </div>
+    <section className="min-h-0 flex-1 md:h-full">
+      <div className="grid h-full min-h-0 gap-3 md:grid-cols-[minmax(0,1fr)_340px] lg:grid-cols-[minmax(0,1fr)_380px] xl:grid-cols-[minmax(0,1fr)_440px] 2xl:grid-cols-[minmax(0,1fr)_500px]">
+        <div className="flex min-h-[460px] flex-col border border-cyan-200/25 bg-[#050912]/95 p-3 shadow-[0_0_80px_rgba(20,184,166,0.18)] backdrop-blur md:min-h-0 xl:p-4">
+          <div className="mb-3 grid shrink-0 gap-2 xl:grid-cols-[minmax(230px,0.34fr)_minmax(0,1fr)] xl:items-end">
+            <div className="min-w-0">
+              <p className="truncate text-[10px] uppercase tracking-[0.34em] text-cyan-200/70">
+                Local Vision / Expanded Signal AI
+              </p>
+              <h1 className="mt-1 truncate text-2xl font-semibold tracking-tight text-white lg:text-3xl 2xl:text-4xl">
+                Expression Signal Console
+              </h1>
+            </div>
 
-        <div className="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-          <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
-          <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
-          <Metric label="Signal" value={clampPercent(signalStrength)} />
-          <Metric label="Window" value={`${sampleCount} samples`} />
-          <Metric
-            label="Quality"
-            value={clampPercent(visionMetrics?.frameMetrics.qualityScore ?? 0)}
-          />
-          <Metric
-            label="Pose"
-            value={
-              visionMetrics?.headPose.matrixAvailable
-                ? `${Math.round(visionMetrics.headPose.yaw)}deg`
-                : "Pending"
-            }
-          />
-        </div>
-      </header>
+            <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3 xl:grid-cols-6">
+              <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
+              <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
+              <Metric label="Signal" value={clampPercent(signalStrength)} />
+              <Metric label="Window" value={`${sampleCount} samples`} />
+              <Metric
+                label="Quality"
+                value={clampPercent(visionMetrics?.frameMetrics.qualityScore ?? 0)}
+              />
+              <Metric
+                label="Pose"
+                value={
+                  visionMetrics?.headPose.matrixAvailable
+                    ? `${Math.round(visionMetrics.headPose.yaw)}deg`
+                    : "Pending"
+                }
+              />
+            </div>
+          </div>
 
-      <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[minmax(0,1fr)_400px] xl:grid-cols-[minmax(0,1fr)_440px] 2xl:grid-cols-[minmax(0,1fr)_500px]">
-        <div className="flex min-h-[460px] flex-col border border-cyan-200/25 bg-[#050912]/95 p-3 shadow-[0_0_80px_rgba(20,184,166,0.18)] backdrop-blur lg:min-h-0 xl:p-4">
-          <div className="relative min-h-[300px] flex-1 overflow-hidden border border-cyan-100/30 bg-black shadow-[inset_0_0_80px_rgba(8,145,178,0.16)] lg:min-h-0">
+          <div className="relative min-h-[260px] flex-1 overflow-hidden border border-cyan-100/30 bg-black shadow-[inset_0_0_80px_rgba(8,145,178,0.16)] md:min-h-0">
             <video
               ref={videoRef}
-              className="h-full min-h-[300px] w-full object-cover opacity-95 lg:min-h-0"
+              className="h-full min-h-[260px] w-full object-cover opacity-95 md:min-h-0"
               muted
               playsInline
               autoPlay
@@ -862,7 +862,7 @@ export default function FaceExpressionAnalyzer() {
           </div>
         </div>
 
-        <div className="grid min-h-0 gap-3 lg:grid-rows-[auto_minmax(0,1fr)]">
+        <div className="grid min-h-0 gap-3 md:grid-rows-[auto_minmax(0,1fr)]">
           <div className="border border-violet-200/25 bg-[#100d19]/95 p-4 shadow-[0_0_70px_rgba(139,92,246,0.16)] backdrop-blur xl:p-5">
             <p className="text-[11px] uppercase tracking-[0.32em] text-violet-200/70">
               AI Interpretation
@@ -1034,7 +1034,7 @@ function DetailedReport({
 
 function SignalMatrix({ signalRows }: { signalRows: SignalRow[] }) {
   return (
-    <div className="flex min-h-[260px] flex-col overflow-hidden border border-amber-200/20 bg-[#15110b]/95 p-4 shadow-[0_0_50px_rgba(251,191,36,0.08)] backdrop-blur lg:min-h-0 xl:p-5">
+    <div className="flex min-h-[260px] flex-col overflow-hidden border border-amber-200/20 bg-[#15110b]/95 p-4 shadow-[0_0_50px_rgba(251,191,36,0.08)] backdrop-blur md:min-h-0 xl:p-5">
       <p className="shrink-0 text-[11px] uppercase tracking-[0.32em] text-amber-200/70">
         Signal Matrix
       </p>
@@ -1093,11 +1093,11 @@ function BulletList({ items }: { items: string[] }) {
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="border border-white/10 bg-white/[0.03] p-2.5">
-      <p className="text-[10px] uppercase tracking-[0.24em] text-cyan-200/70">
+    <div className="min-w-0 border border-white/10 bg-white/[0.03] px-2 py-1.5">
+      <p className="truncate text-[9px] uppercase tracking-[0.2em] text-cyan-200/70">
         {label}
       </p>
-      <p className="mt-1 truncate text-sm font-semibold text-white">{value}</p>
+      <p className="mt-0.5 truncate text-xs font-semibold text-white">{value}</p>
     </div>
   );
 }
