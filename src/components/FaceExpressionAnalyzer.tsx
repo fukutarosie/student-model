@@ -130,7 +130,30 @@ type AnalysisResult = {
   confidence: number;
   reason: string;
   warning: string;
-  report: ExpressionReport;
+};
+
+type ExpressionScoreMap = Record<AnalysisResult["expression"], number>;
+
+type CommunicationResult = {
+  summary: string;
+  communicationTone:
+    | "supportive"
+    | "uncertain"
+    | "tense"
+    | "engaged"
+    | "disengaged"
+    | "mixed";
+  confidence: number;
+  visibleExpression: AnalysisResult["expression"];
+  audioContentExpression: AnalysisResult["expression"];
+  finalExpression: AnalysisResult["expression"];
+  audioContentScores: ExpressionScoreMap;
+  facialExpressionScores: ExpressionScoreMap;
+  combinedExpressionScores: ExpressionScoreMap;
+  spokenSignals: string[];
+  facialSignals: string[];
+  recommendation: string;
+  warning: string;
 };
 
 type SignalRow = {
@@ -139,7 +162,45 @@ type SignalRow = {
   value: number;
 };
 
-const EXPRESSION_LABELS: Record<Expression, string> = {
+type SpeechRecognitionResultItem = {
+  transcript: string;
+};
+
+type SpeechRecognitionResultListItem = {
+  isFinal: boolean;
+  [index: number]: SpeechRecognitionResultItem;
+};
+
+type SpeechRecognitionEvent = Event & {
+  resultIndex: number;
+  results: {
+    length: number;
+    [index: number]: SpeechRecognitionResultListItem;
+  };
+};
+
+type SpeechRecognitionLike = EventTarget & {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: Event & { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    webkitAudioContext?: typeof AudioContext;
+  }
+}
+
+const EXPRESSION_LABELS: Record<AnalysisResult["expression"], string> = {
   happy: "Happy",
   neutral: "Neutral",
   focused: "Focused",
@@ -171,8 +232,8 @@ const MODEL_URL =
 const SAMPLE_WINDOW_MS = 4000;
 const SAMPLE_INTERVAL_MS = 120;
 const MAX_SCORE_SAMPLES = 48;
-const FRAME_SAMPLE_WIDTH = 56;
-const FRAME_SAMPLE_HEIGHT = 40;
+const COMMUNICATION_WARNING =
+  "This combines visible expression and transcript cues only. It is not a diagnosis or proof of a participant's real feelings.";
 
 function isMediaPipeInfoLog(args: unknown[]) {
   return args.some(
@@ -182,24 +243,13 @@ function isMediaPipeInfoLog(args: unknown[]) {
   );
 }
 
-function createEmptyScores(): CoreBlendshapeScores {
+function createEmptyScores(): BlendshapeScores {
   return Object.fromEntries(
-    CORE_BLENDSHAPE_KEYS.map((key) => [key, 0]),
-  ) as CoreBlendshapeScores;
+    BLENDSHAPE_KEYS.map((key) => [key, 0]),
+  ) as BlendshapeScores;
 }
 
-function extractAllScores(categories: Category[]): AllBlendshapeScores {
-  return Object.fromEntries(
-    categories
-      .filter((category) => Number.isFinite(category.score))
-      .map((category) => [
-        category.categoryName,
-        Math.max(0, Math.min(1, category.score)),
-      ]),
-  );
-}
-
-function extractCoreScores(allScores: AllBlendshapeScores): CoreBlendshapeScores {
+function extractScores(categories: Category[]): BlendshapeScores {
   const scores = createEmptyScores();
 
   for (const key of CORE_BLENDSHAPE_KEYS) {
@@ -564,12 +614,16 @@ function getSignalRows(
 export default function FaceExpressionAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-  const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const latestScoresRef = useRef<CoreBlendshapeScores>(createEmptyScores());
-  const latestAllScoresRef = useRef<AllBlendshapeScores>({});
-  const latestVisionMetricsRef = useRef<VisionMetrics | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const shouldListenRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioMonitorFrameRef = useRef<number | null>(null);
+  const latestScoresRef = useRef<BlendshapeScores>(createEmptyScores());
   const scoreHistoryRef = useRef<ScoreSample[]>([]);
   const lastUiUpdateRef = useRef(0);
   const lastSampleAtRef = useRef(0);
@@ -579,6 +633,27 @@ export default function FaceExpressionAnalyzer() {
   const [hasFace, setHasFace] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [recordingUrl, setRecordingUrl] = useState("");
+  const [recordingMimeType, setRecordingMimeType] = useState("");
+  const [recordingAudioStatus, setRecordingAudioStatus] = useState("Not recording");
+  const [transcript, setTranscript] = useState("");
+  const [interimTranscript, setInterimTranscript] = useState("");
+  const [speechSupported, setSpeechSupported] = useState(true);
+  const [speechLanguage, setSpeechLanguage] = useState("en-US");
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("");
+  const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>(
+    [],
+  );
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [hasAudioSignal, setHasAudioSignal] = useState(false);
+  const [microphoneStatus, setMicrophoneStatus] = useState("Starting");
+  const [microphoneLabel, setMicrophoneLabel] = useState("Default microphone");
+  const [communicationResult, setCommunicationResult] =
+    useState<CommunicationResult | null>(null);
+  const [isAnalyzingCommunication, setIsAnalyzingCommunication] =
+    useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [isReportOpen, setIsReportOpen] = useState(false);
@@ -593,6 +668,176 @@ export default function FaceExpressionAnalyzer() {
     () => Math.max(...signalRows.map((signal) => signal.value)),
     [signalRows],
   );
+
+  const loadAudioInputDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      return;
+    }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    setAudioInputDevices(
+      devices.filter((device) => device.kind === "audioinput"),
+    );
+  }, []);
+
+  const stopAudioMonitor = useCallback(() => {
+    if (audioMonitorFrameRef.current !== null) {
+      cancelAnimationFrame(audioMonitorFrameRef.current);
+      audioMonitorFrameRef.current = null;
+    }
+
+    audioContextRef.current?.close();
+    audioContextRef.current = null;
+    setAudioLevel(0);
+    setHasAudioSignal(false);
+  }, []);
+
+  const startAudioMonitor = useCallback((stream: MediaStream) => {
+    stopAudioMonitor();
+
+    const audioTrack = stream.getAudioTracks()[0];
+
+    if (!audioTrack) {
+      setMicrophoneStatus("No microphone track");
+      return;
+    }
+
+    setMicrophoneStatus(audioTrack.enabled ? "Ready" : "Muted");
+    setMicrophoneLabel(audioTrack.label || "Default microphone");
+
+    try {
+      const AudioContextConstructor =
+        window.AudioContext ?? window.webkitAudioContext;
+      const audioContext = new AudioContextConstructor();
+      const source = audioContext.createMediaStreamSource(
+        new MediaStream([audioTrack]),
+      );
+      const analyser = audioContext.createAnalyser();
+
+      analyser.fftSize = 1024;
+      const data = new Uint8Array(analyser.fftSize);
+      source.connect(analyser);
+      audioContextRef.current = audioContext;
+
+      const monitor = () => {
+        analyser.getByteTimeDomainData(data);
+
+        let sum = 0;
+
+        for (const value of data) {
+          const centered = value - 128;
+          sum += centered * centered;
+        }
+
+        const rms = Math.sqrt(sum / data.length) / 128;
+        const nextLevel = Math.min(1, rms * 12);
+
+        setAudioLevel(nextLevel);
+        setHasAudioSignal(nextLevel > 0.01);
+        audioMonitorFrameRef.current = requestAnimationFrame(monitor);
+      };
+
+      monitor();
+    } catch {
+      setMicrophoneStatus("Audio meter unavailable");
+    }
+  }, [stopAudioMonitor]);
+
+  const applyMediaStream = useCallback(
+    async (stream: MediaStream) => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = stream;
+
+      const video = videoRef.current;
+
+      if (video) {
+        video.srcObject = stream;
+        await video.play();
+      }
+      await loadAudioInputDevices();
+    },
+    [loadAudioInputDevices],
+  );
+
+  const getMediaStream = useCallback(async () => {
+    return navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user" },
+      audio: false,
+    });
+  }, []);
+
+  const getAudioStream = useCallback(async (audioDeviceId?: string) => {
+    return navigator.mediaDevices.getUserMedia({
+      video: false,
+      audio: audioDeviceId
+        ? {
+            deviceId: { exact: audioDeviceId },
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: true,
+          }
+        : {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: true,
+          },
+    });
+  }, []);
+
+  const applyAudioStream = useCallback(
+    async (stream: MediaStream) => {
+      audioStreamRef.current?.getTracks().forEach((track) => track.stop());
+      audioStreamRef.current = stream;
+      startAudioMonitor(stream);
+
+      const audioTrack = stream.getAudioTracks()[0];
+      const audioDeviceId = audioTrack?.getSettings().deviceId;
+
+      if (audioDeviceId) {
+        setSelectedAudioDeviceId(audioDeviceId);
+      }
+
+      if (audioTrack) {
+        audioTrack.enabled = true;
+        setRecordingAudioStatus("Audio stream ready");
+      }
+
+      await loadAudioInputDevices();
+    },
+    [loadAudioInputDevices, startAudioMonitor],
+  );
+
+  const refreshAudioStream = useCallback(
+    async (audioDeviceId?: string) => {
+      const stream = await getAudioStream(audioDeviceId || selectedAudioDeviceId);
+      await applyAudioStream(stream);
+      await audioContextRef.current?.resume();
+      return stream;
+    },
+    [applyAudioStream, getAudioStream, selectedAudioDeviceId],
+  );
+
+  const resumeAudioDetection = useCallback(async () => {
+    try {
+      if (audioContextRef.current?.state === "suspended") {
+        await audioContextRef.current.resume();
+      }
+
+      const audioTrack =
+        audioStreamRef.current?.getAudioTracks()[0] ??
+        streamRef.current?.getAudioTracks()[0];
+
+      if (audioTrack) {
+        audioTrack.enabled = true;
+        setMicrophoneStatus(isListening ? "Listening" : "Ready");
+        return;
+      }
+
+      setMicrophoneStatus("No microphone track");
+    } catch {
+      setMicrophoneStatus("Audio resume failed");
+    }
+  }, [isListening]);
 
   useEffect(() => {
     let cancelled = false;
@@ -619,19 +864,22 @@ export default function FaceExpressionAnalyzer() {
           return;
         }
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
-          audio: false,
-        });
+        const stream = await getMediaStream();
 
         if (cancelled) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
 
-        streamRef.current = stream;
-        video.srcObject = stream;
-        await video.play();
+        await applyMediaStream(stream);
+        const audioStream = await getAudioStream();
+
+        if (cancelled) {
+          audioStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        await applyAudioStream(audioStream);
 
         const vision = await FilesetResolver.forVisionTasks(WASM_URL);
         const landmarker = await FaceLandmarker.createFromOptions(vision, {
@@ -761,14 +1009,307 @@ export default function FaceExpressionAnalyzer() {
       landmarkerRef.current?.close();
       landmarkerRef.current = null;
 
+      if (mediaRecorderRef.current?.state === "recording") {
+        mediaRecorderRef.current.stop();
+      }
+      speechRecognitionRef.current?.stop();
+      speechRecognitionRef.current = null;
+      stopAudioMonitor();
+
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+      audioStreamRef.current?.getTracks().forEach((track) => track.stop());
+      audioStreamRef.current = null;
 
       if (console.error === patchedConsoleError) {
         console.error = originalConsoleError;
       }
     };
+  }, [
+    applyAudioStream,
+    applyMediaStream,
+    getAudioStream,
+    getMediaStream,
+    stopAudioMonitor,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (recordingUrl) {
+        URL.revokeObjectURL(recordingUrl);
+      }
+    };
+  }, [recordingUrl]);
+
+  const startSpeechRecognition = useCallback(() => {
+    if (isListening) {
+      return;
+    }
+
+    void resumeAudioDetection();
+
+    const SpeechRecognition =
+      window.SpeechRecognition ?? window.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      setSpeechSupported(false);
+      setError(
+        "Speech recognition is not available in this browser. Chrome or Edge works best.",
+      );
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = speechLanguage;
+    shouldListenRef.current = true;
+
+    recognition.onresult = (event) => {
+      let finalText = "";
+      let interimText = "";
+
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const resultItem = event.results[index];
+        const text = resultItem[0]?.transcript ?? "";
+
+        if (resultItem.isFinal) {
+          finalText += text;
+        } else {
+          interimText += text;
+        }
+      }
+
+      if (finalText.trim()) {
+        setTranscript((current) =>
+          `${current}${current ? " " : ""}${finalText.trim()}`.trim(),
+        );
+      }
+
+      setInterimTranscript(interimText.trim());
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error === "no-speech") {
+        return;
+      }
+
+      setError(`Speech recognition issue: ${event.error ?? "unknown error"}.`);
+    };
+
+    recognition.onend = () => {
+      if (shouldListenRef.current) {
+        try {
+          recognition.start();
+        } catch {
+          setIsListening(false);
+        }
+        return;
+      }
+
+      setIsListening(false);
+    };
+
+    speechRecognitionRef.current = recognition;
+
+    try {
+      recognition.start();
+      setIsListening(true);
+      setSpeechSupported(true);
+      setMicrophoneStatus((current) =>
+        current === "Ready" ? "Listening" : current,
+      );
+    } catch {
+      setError("Speech recognition could not be started.");
+      setIsListening(false);
+    }
+  }, [isListening, resumeAudioDetection, speechLanguage]);
+
+  const stopSpeechRecognition = useCallback(() => {
+    shouldListenRef.current = false;
+    speechRecognitionRef.current?.stop();
+    setIsListening(false);
+    setInterimTranscript("");
+    setMicrophoneStatus((current) =>
+      current === "Listening" ? "Ready" : current,
+    );
   }, []);
+
+  const switchAudioDevice = useCallback(
+    async (deviceId: string) => {
+      if (!deviceId || deviceId === selectedAudioDeviceId) {
+        return;
+      }
+
+      try {
+        stopSpeechRecognition();
+        setError("");
+        setMicrophoneStatus("Switching microphone");
+        await refreshAudioStream(deviceId);
+        setMicrophoneStatus("Ready");
+      } catch (switchError) {
+        setError(
+          switchError instanceof Error
+            ? switchError.message
+            : "Unable to switch microphone.",
+        );
+      }
+    },
+    [
+      refreshAudioStream,
+      selectedAudioDeviceId,
+      stopSpeechRecognition,
+    ],
+  );
+
+  const toggleMicrophone = useCallback(() => {
+    const audioTracks = audioStreamRef.current?.getAudioTracks() ?? [];
+    const shouldEnable = audioTracks.some((track) => !track.enabled);
+
+    for (const track of audioTracks) {
+      track.enabled = shouldEnable;
+    }
+
+    setMicrophoneStatus(shouldEnable ? "Ready" : "Muted");
+
+    if (!shouldEnable) {
+      stopSpeechRecognition();
+    } else {
+      void resumeAudioDetection();
+    }
+  }, [resumeAudioDetection, stopSpeechRecognition]);
+
+  const startRecording = useCallback(async () => {
+    await resumeAudioDetection();
+
+    let stream = streamRef.current;
+
+    if (!stream) {
+      setError("Camera and microphone are not ready yet.");
+      return;
+    }
+
+    if (!window.MediaRecorder) {
+      setError("This browser does not support session recording.");
+      return;
+    }
+
+    if (recordingUrl) {
+      URL.revokeObjectURL(recordingUrl);
+      setRecordingUrl("");
+    }
+
+    let videoTracks = stream
+      .getVideoTracks()
+      .filter((track) => track.readyState === "live");
+    let audioStream = audioStreamRef.current;
+    let audioTracks = (audioStream?.getAudioTracks() ?? [])
+      .filter((track) => track.readyState === "live");
+
+    if (videoTracks.length === 0 || audioTracks.length === 0) {
+      try {
+        if (videoTracks.length === 0) {
+          const refreshedStream = await getMediaStream();
+          await applyMediaStream(refreshedStream);
+          stream = refreshedStream;
+          videoTracks = stream
+            .getVideoTracks()
+            .filter((track) => track.readyState === "live");
+        }
+
+        if (audioTracks.length === 0) {
+          audioStream = await refreshAudioStream(selectedAudioDeviceId);
+          audioTracks = audioStream
+            .getAudioTracks()
+            .filter((track) => track.readyState === "live");
+        }
+      } catch {
+        setError("Unable to refresh camera and microphone before recording.");
+        return;
+      }
+    }
+
+    if (videoTracks.length === 0) {
+      setError("Recording cannot start because no live camera track was found.");
+      return;
+    }
+
+    if (audioTracks.length === 0) {
+      setError("Recording cannot start because no live microphone track was found.");
+      setRecordingAudioStatus("No audio track");
+      return;
+    }
+
+    for (const audioTrack of audioTracks) {
+      audioTrack.enabled = true;
+    }
+
+    const recordingStream = new MediaStream([
+      ...videoTracks,
+      ...audioTracks,
+    ]);
+    const preferredTypes = [
+      "video/webm;codecs=vp9,opus",
+      "video/webm;codecs=vp8,opus",
+      "video/webm",
+    ];
+    const mimeType =
+      preferredTypes.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
+    const recorder = new MediaRecorder(
+      recordingStream,
+      mimeType ? { mimeType } : undefined,
+    );
+
+    recordedChunksRef.current = [];
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        recordedChunksRef.current.push(event.data);
+      }
+    };
+    recorder.onstop = () => {
+      const blob = new Blob(recordedChunksRef.current, {
+        type: recorder.mimeType || "video/webm",
+      });
+      setRecordingMimeType(blob.type);
+      setRecordingUrl(URL.createObjectURL(blob));
+      setIsRecording(false);
+      setRecordingAudioStatus(
+        audioTracks.length > 0 ? "Audio track recorded" : "No audio track",
+      );
+    };
+    recorder.onerror = () => {
+      setError("Recording failed while capturing camera or microphone.");
+      setIsRecording(false);
+      setRecordingAudioStatus("Recording failed");
+    };
+
+    mediaRecorderRef.current = recorder;
+    setError("");
+    setCommunicationResult(null);
+    setRecordingAudioStatus(
+      `Recording ${audioTracks.length} audio track${audioTracks.length === 1 ? "" : "s"}`,
+    );
+    recorder.start(1000);
+    setIsRecording(true);
+    startSpeechRecognition();
+  }, [
+    applyMediaStream,
+    getMediaStream,
+    recordingUrl,
+    refreshAudioStream,
+    resumeAudioDetection,
+    selectedAudioDeviceId,
+    startSpeechRecognition,
+  ]);
+
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+
+    stopSpeechRecognition();
+    setIsRecording(false);
+  }, [stopSpeechRecognition]);
 
   const analyzeExpression = useCallback(async () => {
     if (!hasFace) {
@@ -812,38 +1353,73 @@ export default function FaceExpressionAnalyzer() {
     }
   }, [hasFace]);
 
-  return (
-    <section className="min-h-0 flex-1 md:h-full">
-      <div className="grid h-full min-h-0 gap-3 md:grid-cols-[minmax(0,1fr)_340px] lg:grid-cols-[minmax(0,1fr)_380px] xl:grid-cols-[minmax(0,1fr)_440px] 2xl:grid-cols-[minmax(0,1fr)_500px]">
-        <div className="flex min-h-[460px] flex-col border border-cyan-200/25 bg-[#050912]/95 p-3 shadow-[0_0_80px_rgba(20,184,166,0.18)] backdrop-blur md:min-h-0 xl:p-4">
-          <div className="mb-3 grid shrink-0 gap-2 xl:grid-cols-[minmax(230px,0.34fr)_minmax(0,1fr)] xl:items-end">
-            <div className="min-w-0">
-              <p className="truncate text-[10px] uppercase tracking-[0.34em] text-cyan-200/70">
-                Local Vision / Expanded Signal AI
-              </p>
-              <h1 className="mt-1 truncate text-2xl font-semibold tracking-tight text-white lg:text-3xl 2xl:text-4xl">
-                Expression Signal Console
-              </h1>
-            </div>
+  const analyzeCommunication = useCallback(async () => {
+    if (!transcript.trim() && !interimTranscript.trim()) {
+      setError("Record or listen to participant words before analyzing communication.");
+      return;
+    }
 
-            <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3 xl:grid-cols-6">
-              <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
-              <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
-              <Metric label="Signal" value={clampPercent(signalStrength)} />
-              <Metric label="Window" value={`${sampleCount} samples`} />
-              <Metric
-                label="Quality"
-                value={clampPercent(visionMetrics?.frameMetrics.qualityScore ?? 0)}
-              />
-              <Metric
-                label="Pose"
-                value={
-                  visionMetrics?.headPose.matrixAvailable
-                    ? `${Math.round(visionMetrics.headPose.yaw)}deg`
-                    : "Pending"
-                }
-              />
-            </div>
+    setIsAnalyzingCommunication(true);
+    setError("");
+    setCommunicationResult(null);
+
+    try {
+      const response = await fetch("/api/analyze-communication", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          scores: latestScoresRef.current,
+          samples: scoreHistoryRef.current,
+          expressionResult: result,
+          transcript: `${transcript} ${interimTranscript}`.trim(),
+        }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error ?? "Communication analysis failed.");
+      }
+
+      setCommunicationResult(data as CommunicationResult);
+    } catch (communicationError) {
+      setError(
+        communicationError instanceof Error
+          ? communicationError.message
+          : "Unable to analyze communication.",
+      );
+    } finally {
+      setIsAnalyzingCommunication(false);
+    }
+  }, [interimTranscript, result, transcript]);
+
+  const clearSession = useCallback(() => {
+    if (recordingUrl) {
+      URL.revokeObjectURL(recordingUrl);
+    }
+
+    setRecordingUrl("");
+    setRecordingMimeType("");
+    setRecordingAudioStatus("Not recording");
+    setTranscript("");
+    setInterimTranscript("");
+    setCommunicationResult(null);
+  }, [recordingUrl]);
+
+  return (
+    <section className="min-h-0 flex-1 md:h-[calc(100vh-112px)]">
+      <div className="grid h-full min-h-0 gap-3 md:grid-cols-[minmax(0,1.6fr)_minmax(330px,0.75fr)]">
+        <div className="flex min-h-[420px] flex-col overflow-hidden border border-cyan-200/20 bg-[#080b12]/90 p-3 shadow-[0_0_56px_rgba(20,184,166,0.12)] backdrop-blur md:min-h-0">
+          <div className="mb-3 grid shrink-0 grid-cols-2 gap-2 xl:grid-cols-5">
+            <Metric label="Face" value={hasFace ? "Face detected" : "No face"} />
+            <Metric label="Model" value={isReady ? "Ready" : "Loading"} />
+            <Metric label="Signal" value={clampPercent(signalStrength)} />
+            <Metric
+              label="Audio"
+              value={hasAudioSignal ? "Signal detected" : microphoneStatus}
+            />
+            <Metric label="Window" value={`${sampleCount} samples`} />
           </div>
 
           <div className="relative min-h-[260px] flex-1 overflow-hidden border border-cyan-100/30 bg-black shadow-[inset_0_0_80px_rgba(8,145,178,0.16)] md:min-h-0">
@@ -854,16 +1430,138 @@ export default function FaceExpressionAnalyzer() {
               playsInline
               autoPlay
             />
-            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,rgba(34,211,238,0.12),transparent_34%),linear-gradient(90deg,rgba(34,211,238,0.09)_1px,transparent_1px),linear-gradient(0deg,rgba(34,211,238,0.08)_1px,transparent_1px)] bg-[size:100%_100%,54px_54px,54px_54px]" />
-            <div className="pointer-events-none absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-cyan-300/16 to-transparent" />
-            <div className="pointer-events-none absolute bottom-4 left-4 border border-cyan-200/30 bg-black/60 px-4 py-2 text-[11px] uppercase tracking-[0.28em] text-cyan-100/80 backdrop-blur">
-              Expanded Vision Telemetry
+            <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,rgba(34,211,238,0.08)_1px,transparent_1px),linear-gradient(0deg,rgba(34,211,238,0.07)_1px,transparent_1px)] bg-[size:42px_42px]" />
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-b from-cyan-300/12 to-transparent" />
+            <div className="pointer-events-none absolute bottom-3 left-3 border border-cyan-200/25 bg-black/55 px-3 py-2 text-[11px] uppercase tracking-[0.26em] text-cyan-100/75 backdrop-blur">
+              Live Expression + Voice Session
             </div>
+          </div>
+
+          <div className="mt-3 min-h-0 shrink-0 overflow-y-auto pr-1 md:max-h-[260px]">
+            <div className="grid gap-2 sm:grid-cols-3">
+              <button
+                type="button"
+                onClick={isRecording ? stopRecording : startRecording}
+                disabled={!isReady}
+                className="h-11 border border-cyan-100/40 bg-cyan-100 px-4 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
+              >
+                {isRecording ? "Stop Recording" : "Record Session"}
+              </button>
+              <button
+                type="button"
+                onClick={isListening ? stopSpeechRecognition : startSpeechRecognition}
+                disabled={!speechSupported}
+                className="h-11 border border-white/15 bg-white/[0.04] px-4 text-sm font-semibold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:text-slate-500"
+              >
+                {isListening ? "Stop Voice" : "Listen Voice"}
+              </button>
+              <button
+                type="button"
+                onClick={clearSession}
+                className="h-11 border border-white/15 bg-black/30 px-4 text-sm font-semibold text-slate-200 transition hover:bg-white/10"
+              >
+                Clear Session
+              </button>
+            </div>
+
+            <div className="mt-3 border border-sky-200/20 bg-sky-950/15 p-3">
+              <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+                <div>
+                  <div className="flex items-center justify-between gap-3 text-xs uppercase tracking-[0.22em] text-sky-100/70">
+                    <span>Audio Detection</span>
+                    <span>{Math.round(audioLevel * 100)}%</span>
+                  </div>
+                  <div className="mt-2 h-2 bg-white/10">
+                    <div
+                      className={`h-full ${
+                        hasAudioSignal ? "bg-emerald-300" : "bg-sky-200"
+                      }`}
+                      style={{ width: clampPercent(audioLevel) }}
+                    />
+                  </div>
+                  <p className="mt-2 truncate text-xs text-slate-400">
+                    {microphoneLabel} / {microphoneStatus}
+                  </p>
+                  <p className="mt-1 truncate text-xs text-sky-100/70">
+                    Recorder: {recordingAudioStatus}
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
+                  <select
+                    value={selectedAudioDeviceId}
+                    onChange={(event) => void switchAudioDevice(event.target.value)}
+                    className="h-10 min-w-0 border border-white/15 bg-black/40 px-2 text-xs text-slate-100 xl:col-span-2"
+                    aria-label="Microphone input device"
+                  >
+                    {audioInputDevices.length === 0 ? (
+                      <option value="">Default microphone</option>
+                    ) : null}
+                    {audioInputDevices.map((device, index) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {device.label || `Microphone ${index + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={speechLanguage}
+                    onChange={(event) => setSpeechLanguage(event.target.value)}
+                    className="h-10 border border-white/15 bg-black/40 px-2 text-xs text-slate-100"
+                    aria-label="Speech recognition language"
+                  >
+                    <option value="en-US">English US</option>
+                    <option value="en-GB">English UK</option>
+                    <option value="id-ID">Indonesian</option>
+                    <option value="zh-CN">Chinese</option>
+                    <option value="ja-JP">Japanese</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={toggleMicrophone}
+                    className="h-10 border border-white/15 bg-white/[0.04] px-3 text-xs font-semibold text-slate-100 transition hover:bg-white/10"
+                  >
+                    {microphoneStatus === "Muted" ? "Enable Mic" : "Mute Mic"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void resumeAudioDetection()}
+                    className="h-10 border border-sky-100/25 bg-sky-100/10 px-3 text-xs font-semibold text-sky-100 transition hover:bg-sky-100/20"
+                  >
+                    Test Mic
+                  </button>
+                </div>
+              </div>
+              {!hasAudioSignal && microphoneStatus !== "Muted" ? (
+                <p className="mt-2 text-xs leading-5 text-sky-100/65">
+                  Speak near the microphone. If the meter stays at 0%, check browser
+                  microphone permission and Windows input device settings.
+                </p>
+              ) : null}
+            </div>
+
+            {recordingUrl ? (
+              <div className="mt-3 border border-emerald-200/25 bg-emerald-950/20 p-3">
+                <div className="flex items-center justify-between gap-3 text-xs uppercase tracking-[0.22em] text-emerald-100/70">
+                  <span>Recorded Session</span>
+                  <a
+                    href={recordingUrl}
+                    download={`communication-session.${recordingMimeType.includes("mp4") ? "mp4" : "webm"}`}
+                    className="text-emerald-100 underline-offset-4 hover:underline"
+                  >
+                    Download
+                  </a>
+                </div>
+                <video
+                  className="mt-2 max-h-40 w-full bg-black"
+                  src={recordingUrl}
+                  controls
+                />
+              </div>
+            ) : null}
           </div>
         </div>
 
-        <div className="grid min-h-0 gap-3 md:grid-rows-[auto_minmax(0,1fr)]">
-          <div className="border border-violet-200/25 bg-[#100d19]/95 p-4 shadow-[0_0_70px_rgba(139,92,246,0.16)] backdrop-blur xl:p-5">
+        <div className="grid min-h-0 gap-3 overflow-y-auto pr-1 md:grid-rows-[auto_minmax(300px,1.15fr)_minmax(210px,0.75fr)]">
+          <div className="border border-violet-200/20 bg-[#11101a]/90 p-4 shadow-[0_0_56px_rgba(139,92,246,0.12)] backdrop-blur">
             <p className="text-[11px] uppercase tracking-[0.32em] text-violet-200/70">
               AI Interpretation
             </p>
@@ -871,31 +1569,28 @@ export default function FaceExpressionAnalyzer() {
               Visible Expression
             </h2>
 
-            <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
-              <button
-                type="button"
-                onClick={analyzeExpression}
-                disabled={!hasFace || isAnalyzing}
-                className="h-12 border border-cyan-100/40 bg-cyan-100 px-5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500 xl:h-14 xl:px-6"
-              >
-                {isAnalyzing ? "Interpreting..." : "Analyze"}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsReportOpen(true);
-                  setHasViewedReport(true);
-                }}
-                disabled={!result || isAnalyzing}
-                className={`h-12 border px-4 text-sm font-semibold transition disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-slate-900/60 disabled:text-slate-600 xl:h-14 xl:px-5 ${
-                  hasViewedReport
-                    ? "border-emerald-200/40 bg-emerald-200/10 text-emerald-50 shadow-[0_0_24px_rgba(16,185,129,0.12)] hover:border-emerald-100 hover:bg-emerald-200/15"
-                    : "border-violet-200/35 bg-violet-200/10 text-violet-50 hover:border-violet-100 hover:bg-violet-200/20"
-                }`}
-              >
-                {hasViewedReport ? "Viewed" : "Report"}
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={analyzeExpression}
+              disabled={!hasFace || isAnalyzing}
+              className="mt-3 h-12 w-full border border-cyan-100/40 bg-cyan-100 px-5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
+            >
+              {isAnalyzing ? "Interpreting..." : "Analyze"}
+            </button>
+
+            <button
+              type="button"
+              onClick={analyzeCommunication}
+              disabled={
+                isAnalyzingCommunication ||
+                (!transcript.trim() && !interimTranscript.trim())
+              }
+              className="mt-2 h-12 w-full border border-violet-100/35 bg-violet-200 px-5 text-sm font-semibold text-slate-950 transition hover:bg-white disabled:cursor-not-allowed disabled:border-slate-600 disabled:bg-slate-800 disabled:text-slate-500"
+            >
+              {isAnalyzingCommunication
+                ? "Reading Communication..."
+                : "Analyze Communication"}
+            </button>
 
             {error ? (
               <div className="mt-3 border border-red-300/35 bg-red-950/40 p-3 text-sm leading-5 text-red-100">
@@ -922,172 +1617,137 @@ export default function FaceExpressionAnalyzer() {
             </div>
           </div>
 
-          <SignalMatrix signalRows={signalRows} />
-        </div>
-      </div>
+          <div className="flex min-h-[300px] flex-col overflow-y-auto border border-amber-200/20 bg-[#15110b]/90 p-4 backdrop-blur">
+            <p className="text-[11px] uppercase tracking-[0.32em] text-amber-200/70">
+              Voice Transcript
+            </p>
+            <textarea
+              value={
+                interimTranscript
+                  ? `${transcript}${transcript ? " " : ""}${interimTranscript}`
+                  : transcript
+              }
+              onChange={(event) => {
+                setTranscript(event.target.value);
+                setInterimTranscript("");
+              }}
+              placeholder="Start recording/listening, or type participant words here if browser speech recognition is not working."
+              className="mt-3 min-h-56 flex-1 resize-none border border-white/10 bg-black/25 p-3 text-base leading-7 text-amber-50/90 outline-none placeholder:text-slate-500 focus:border-amber-100/35"
+            />
 
-      {isReportOpen && result ? (
-        <DetailedReport result={result} onClose={() => setIsReportOpen(false)} />
-      ) : null}
-    </section>
-  );
-}
-
-function DetailedReport({
-  result,
-  onClose,
-}: {
-  result: AnalysisResult;
-  onClose: () => void;
-}) {
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm md:justify-end md:p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="expression-report-title"
-    >
-      <div className="flex h-[min(840px,calc(100vh-48px))] w-full max-w-3xl flex-col border border-cyan-200/25 bg-[#071017]/95 p-5 shadow-[0_0_90px_rgba(34,211,238,0.22)] md:mr-4">
-        <div className="flex shrink-0 items-center justify-between gap-3">
-          <p
-            id="expression-report-title"
-            className="text-[11px] uppercase tracking-[0.32em] text-cyan-100/70"
-          >
-            Detailed Report
-          </p>
-          <button
-            type="button"
-            onClick={onClose}
-            className="border border-cyan-100/25 bg-cyan-100/10 px-3 py-1.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/50 hover:bg-cyan-100/20"
-          >
-            Close
-          </button>
-        </div>
-
-        <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1 text-sm leading-5 text-slate-200">
-          <p className="border border-cyan-100/15 bg-cyan-950/20 p-3 text-cyan-50">
-            {result.report.summary}
-          </p>
-
-          <ReportSection title="Primary Cues">
-            <BulletList items={result.report.primaryCues} />
-          </ReportSection>
-
-          <ReportSection title="Counter Signals">
-            <BulletList items={result.report.counterSignals} />
-          </ReportSection>
-
-          <ReportSection title="Alternatives">
-            <div className="grid gap-2">
-              {result.report.alternatives.map((alternative) => (
-                <div
-                  key={`${alternative.expression}-${alternative.reason}`}
-                  className="border border-white/10 bg-white/[0.03] p-2"
-                >
-                  <div className="flex items-center justify-between gap-3 text-xs">
-                    <span className="font-semibold text-cyan-50">
-                      {EXPRESSION_LABELS[alternative.expression]}
+            {communicationResult ? (
+              <div className="mt-3 border border-violet-200/25 bg-violet-950/20 p-3">
+                <p className="text-[11px] uppercase tracking-[0.24em] text-violet-100/70">
+                  Communication Tone
+                </p>
+                <p className="mt-1 text-2xl font-semibold capitalize">
+                  {communicationResult.communicationTone}
+                </p>
+                <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3">
+                  <div className="border border-white/10 bg-black/20 p-2">
+                    <span className="block uppercase tracking-[0.18em] text-slate-500">
+                      Audio Content
                     </span>
-                    <span className="font-mono text-cyan-100">
-                      {formatConfidence(alternative.confidence)}
+                    <span className="mt-1 block font-semibold text-amber-100">
+                      {EXPRESSION_LABELS[communicationResult.audioContentExpression]}
                     </span>
                   </div>
-                  <p className="mt-1 text-xs leading-5 text-slate-400">
-                    {alternative.reason}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </ReportSection>
-
-          <ReportSection title="Temporal Notes">
-            <BulletList items={result.report.temporalNotes} />
-          </ReportSection>
-
-          <ReportSection title="Signal Highlights">
-            <div className="grid gap-2">
-              {result.report.signalHighlights.map((signal) => (
-                <div
-                  key={`${signal.name}-${signal.note}`}
-                  className="grid grid-cols-[1fr_auto] gap-3 border-b border-white/10 pb-2 last:border-b-0 last:pb-0"
-                >
-                  <div>
-                    <p className="text-xs font-semibold text-slate-100">
-                      {getSignalLabel(signal.name)}
-                    </p>
-                    <p className="text-xs leading-5 text-slate-500">
-                      {signal.note}
-                    </p>
+                  <div className="border border-white/10 bg-black/20 p-2">
+                    <span className="block uppercase tracking-[0.18em] text-slate-500">
+                      Face Cues
+                    </span>
+                    <span className="mt-1 block font-semibold text-cyan-100">
+                      {EXPRESSION_LABELS[communicationResult.visibleExpression]}
+                    </span>
                   </div>
-                  <span className="font-mono text-xs text-cyan-100">
-                    {signal.score.toFixed(3)}
-                  </span>
+                  <div className="border border-white/10 bg-black/20 p-2">
+                    <span className="block uppercase tracking-[0.18em] text-slate-500">
+                      Final Expression
+                    </span>
+                    <span className="mt-1 block font-semibold text-violet-100">
+                      {EXPRESSION_LABELS[communicationResult.finalExpression]}
+                    </span>
+                  </div>
                 </div>
-              ))}
-            </div>
-          </ReportSection>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function SignalMatrix({ signalRows }: { signalRows: SignalRow[] }) {
-  return (
-    <div className="flex min-h-[260px] flex-col overflow-hidden border border-amber-200/20 bg-[#15110b]/95 p-4 shadow-[0_0_50px_rgba(251,191,36,0.08)] backdrop-blur md:min-h-0 xl:p-5">
-      <p className="shrink-0 text-[11px] uppercase tracking-[0.32em] text-amber-200/70">
-        Signal Matrix
-      </p>
-      <div className="mt-3 grid min-h-0 flex-1 gap-3 overflow-y-auto pr-1 xl:mt-4 xl:gap-4">
-        {signalRows.map((signal) => (
-          <div key={signal.label}>
-            <div className="mb-1.5 flex items-center justify-between gap-4 text-xs">
-              <span className="font-medium text-amber-50">{signal.label}</span>
-              <span className="text-slate-400">{signal.detail}</span>
-            </div>
-            <div className="h-1.5 bg-white/10">
-              <div
-                className="h-full bg-amber-200"
-                style={{ width: clampPercent(signal.value) }}
-              />
-            </div>
+                <div className="mt-3 grid gap-1.5 text-xs">
+                  {Object.entries(communicationResult.combinedExpressionScores).map(
+                    ([expression, score]) => (
+                      <div key={expression}>
+                        <div className="mb-1 flex items-center justify-between gap-3">
+                          <span className="text-slate-300">
+                            {EXPRESSION_LABELS[expression as AnalysisResult["expression"]]}
+                          </span>
+                          <span className="font-mono text-violet-100">
+                            {Math.round(score * 100)}%
+                          </span>
+                        </div>
+                        <div className="h-1.5 bg-white/10">
+                          <div
+                            className="h-full bg-violet-200"
+                            style={{ width: clampPercent(score) }}
+                          />
+                        </div>
+                      </div>
+                    ),
+                  )}
+                </div>
+                <p className="mt-2 text-sm leading-6 text-slate-200">
+                  {communicationResult.summary}
+                </p>
+                <p className="mt-2 text-sm leading-6 text-cyan-100">
+                  {communicationResult.recommendation}
+                </p>
+                <p className="mt-2 text-xs leading-5 text-slate-400">
+                  {communicationResult.warning || COMMUNICATION_WARNING}
+                </p>
+              </div>
+            ) : null}
           </div>
-        ))}
+
+          <div className="border border-white/10 bg-black/35 p-4 backdrop-blur">
+            <p className="text-[11px] uppercase tracking-[0.32em] text-slate-400">
+              Signal Matrix
+            </p>
+            <div className="mt-3 grid gap-2">
+              {signalRows.slice(0, 4).map((signal) => (
+                <div key={signal.label}>
+                  <div className="mb-1.5 flex items-center justify-between gap-4 text-xs">
+                    <span className="font-medium text-slate-100">
+                      {signal.label}
+                    </span>
+                    <span className="text-slate-500">{signal.detail}</span>
+                  </div>
+                  <div className="h-1.5 bg-white/10">
+                    <div
+                      className="h-full bg-cyan-200"
+                      style={{ width: clampPercent(signal.value) }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+            <dl className="mt-4 grid gap-2 text-xs">
+              {topBlendshapes.map(({ key, score }) => (
+                <div
+                  key={key}
+                  className="grid grid-cols-[1fr_auto] gap-4 border-b border-white/10 pb-2 last:border-b-0 last:pb-0"
+                >
+                  <dt>
+                    <span className="block font-medium text-slate-100">
+                      {BLENDSHAPE_LABELS[key]}
+                    </span>
+                    <span className="text-slate-500">{key}</span>
+                  </dt>
+                  <dd className="font-mono text-cyan-100">
+                    {score.toFixed(3)}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        </div>
       </div>
-    </div>
-  );
-}
-
-function ReportSection({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="mt-3">
-      <p className="mb-2 text-[10px] uppercase tracking-[0.24em] text-cyan-100/55">
-        {title}
-      </p>
-      {children}
-    </div>
-  );
-}
-
-function BulletList({ items }: { items: string[] }) {
-  if (items.length === 0) {
-    return <p className="text-xs text-slate-500">No strong counter-signal.</p>;
-  }
-
-  return (
-    <ul className="grid gap-1.5 text-xs leading-5 text-slate-300">
-      {items.map((item) => (
-        <li key={item} className="border-l border-cyan-100/20 pl-2">
-          {item}
-        </li>
-      ))}
-    </ul>
+    </section>
   );
 }
 
@@ -1101,3 +1761,5 @@ function Metric({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
+
+
